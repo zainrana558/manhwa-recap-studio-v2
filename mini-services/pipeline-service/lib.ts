@@ -136,7 +136,7 @@ export async function fetchMangaHereChapters(
   }> = []
   const seen = new Set<string>()
   const chapterRegex = new RegExp(
-    `href="/manga/${mangaSlug}/(c[0-9.]+)/1\\.html"`,
+    `href="/manga/${mangaSlug}/((?:v\\d+/)?c[0-9.]+)/1\\.html"`,
     'gi',
   )
   let match
@@ -144,7 +144,7 @@ export async function fetchMangaHereChapters(
     const chapSlug = match[1]
     if (seen.has(chapSlug)) continue
     seen.add(chapSlug)
-    const chapterNum = chapSlug.replace(/^c0*/, '').replace(/^0+/, '') || '0'
+    const chapterNum = chapSlug.match(/c([0-9.]+)/) ? (chapSlug.match(/c([0-9.]+)/)![1].replace(/^0+/, '') || '0') : '0'
     chapters.push({
       mangadexId: chapSlug,
       chapterNum,
@@ -190,8 +190,11 @@ export async function fetchMangaHereChapterImages(
     throw new Error(`Could not extract store ID from ${url}`)
   }
 
-  // Extract chapter folder from chapter slug: "c001" → "001", "c200.5" → "200.5"
-  const chapterFolder = chapterSlug.replace(/^c/, '').padStart(3, '0')
+  // Extract chapter folder from chapter slug: "v72/c700" → "700", "c001" → "001", "c200.5" → "200.5"
+  const chapterMatch = chapterSlug.match(/c([0-9.]+)/)
+  const chapterFolder = chapterMatch
+    ? chapterMatch[1].padStart(3, '0')
+    : chapterSlug.replace(/^c/, '').padStart(3, '0')
 
   // Extract image filenames from obfuscated JavaScript.
   // Pattern: {letter}{date}_{time}_{number} e.g. h20181105_144325_927
@@ -282,7 +285,7 @@ export async function fetchFanFoxChapters(
   }> = []
   const seen = new Set<string>()
   const chapterRegex = new RegExp(
-    `href="/manga/${mangaSlug}/(c[0-9.]+)/1\\.html"`,
+    `href="/manga/${mangaSlug}/((?:v\\d+/)?c[0-9.]+)/1\\.html"`,
     'gi',
   )
   let match
@@ -290,7 +293,7 @@ export async function fetchFanFoxChapters(
     const chapSlug = match[1]
     if (seen.has(chapSlug)) continue
     seen.add(chapSlug)
-    const chapterNum = chapSlug.replace(/^c0*/, '').replace(/^0+/, '') || '0'
+    const chapterNum = chapSlug.match(/c([0-9.]+)/) ? (chapSlug.match(/c([0-9.]+)/)![1].replace(/^0+/, '') || '0') : '0'
     chapters.push({
       mangadexId: chapSlug,
       chapterNum,
@@ -322,7 +325,10 @@ export async function fetchFanFoxChapterImages(
   if (!storeId) {
     throw new Error(`Could not extract store ID from ${url}`)
   }
-  const chapterFolder = chapterSlug.replace(/^c/, '').padStart(3, '0')
+  const ffChapMatch = chapterSlug.match(/c([0-9.]+)/)
+  const chapterFolder = ffChapMatch
+    ? ffChapMatch[1].padStart(3, '0')
+    : chapterSlug.replace(/^c/, '').padStart(3, '0')
 
   const filenameRegex = /([a-z]\d{8}_\d{6}_[a-z0-9]+)/gi
   const filenames = new Set<string>()

@@ -424,3 +424,28 @@ Stage Summary:
 - Search 502 error resolved by: (1) ensuring server stays alive, (2) eliminating 502 status codes from API, (3) adding client-side retry
 - Search now returns 200 with results or empty array + warning for all error cases
 - All 5 sources queried in parallel with 5s timeout each
+
+---
+Task ID: pipeline-reconnection-fix
+Agent: Main Agent
+Task: Fix pipeline stuck at search and reconnecting — pipeline service (port 3001) was not running
+
+Work Log:
+- Diagnosed: pipeline mini-service on port 3001 was NOT started, causing WebSocket reconnect loop
+- Installed pipeline service dependencies (bun install in mini-services/pipeline-service/)
+- Generated Prisma client for pipeline service
+- Started pipeline service on port 3001 (socket.io with path "/")
+- Verified socket.io polling works through Caddy gateway with XTransformPort=3001
+- Fixed critical chapter scraping regex bug: MangaHere/FanFox URLs use volume prefix (e.g. v72/c700) but regex only matched c700
+- Updated regex in 3 files: src/lib/scrapers.ts, mini-services/pipeline-service/lib.ts
+- Changed chapter ID format to include full path (v72/c700) for correct image URL construction
+- Fixed chapterFolder extraction in image scraping to handle volume-prefixed chapter slugs
+- Verified: FanFox Naruto returns 750 chapters (was 0 before fix)
+- Verified: Pipeline config page shows "Start Recap Pipeline" button (was disabled before)
+- Verified: No console errors, socket.io connects successfully
+- Both services running: Next.js (port 3000) + Pipeline (port 3001)
+
+Stage Summary:
+- Pipeline reconnecting issue fixed by starting the pipeline service
+- Chapter scraping bug fixed: volume prefix in URLs now properly handled
+- Full pipeline flow verified: search → select → config → start pipeline ready

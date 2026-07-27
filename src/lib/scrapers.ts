@@ -97,14 +97,20 @@ export async function getMangaHereChapters(slug: string): Promise<ScrapedChapter
 
   const chapters: ScrapedChapter[] = [];
   const seen = new Set<string>();
-  const regex = new RegExp(`href="/manga/${slug}/(c[0-9.]+)/1\\.html"`, "gi");
+  // URLs have optional volume prefix: /manga/{slug}/v01/c000/1.html or /manga/{slug}/c000/1.html
+  // Capture the full path (volume + chapter) as the chapter ID for correct image URL construction
+  const regex = new RegExp(`href="/manga/${slug}/((?:v\\d+/)?c[0-9.]+)/1\\.html"`, "gi");
   let match;
   while ((match = regex.exec(html)) !== null) {
-    if (seen.has(match[1])) continue;
-    seen.add(match[1]);
+    const fullPath = match[1]; // e.g. "v72/c700" or "c700"
+    if (seen.has(fullPath)) continue;
+    seen.add(fullPath);
+    // Extract chapter number from the c{num} part
+    const chapterMatch = fullPath.match(/c([0-9.]+)/);
+    const chapterNum = chapterMatch ? (chapterMatch[1].replace(/^0+/, "") || "0") : "0";
     chapters.push({
-      id: match[1],
-      chapterNum: match[1].replace(/^c0*/, "").replace(/^0+/, "") || "0",
+      id: fullPath,
+      chapterNum,
       title: null,
     });
   }
@@ -126,7 +132,9 @@ export async function getMangaHereImages(
   const storeMatch = html.match(/store\/manga\/(\d+)/);
   if (!storeMatch) throw new Error("Could not extract store ID");
   const storeId = storeMatch[1];
-  const chapterFolder = chapterSlug.replace(/^c/, "").padStart(3, "0");
+  const chapterFolder = chapterSlug.match(/c([0-9.]+)/)
+    ? chapterSlug.match(/c([0-9.]+)/)![1].padStart(3, "0")
+    : chapterSlug.replace(/^c/, "").padStart(3, "0");
 
   const filenames = new Set<string>();
   let m;
@@ -189,14 +197,19 @@ export async function getFanFoxChapters(slug: string): Promise<ScrapedChapter[]>
 
   const chapters: ScrapedChapter[] = [];
   const seen = new Set<string>();
-  const regex = new RegExp(`href="/manga/${slug}/(c[0-9.]+)/1\\.html"`, "gi");
+  // URLs have optional volume prefix: /manga/{slug}/v72/c700/1.html or /manga/{slug}/c700/1.html
+  // Capture the full path (volume + chapter) as the chapter ID
+  const regex = new RegExp(`href="/manga/${slug}/((?:v\\d+/)?c[0-9.]+)/1\\.html"`, "gi");
   let match;
   while ((match = regex.exec(html)) !== null) {
-    if (seen.has(match[1])) continue;
-    seen.add(match[1]);
+    const fullPath = match[1]; // e.g. "v72/c700" or "c700"
+    if (seen.has(fullPath)) continue;
+    seen.add(fullPath);
+    const chapterMatch = fullPath.match(/c([0-9.]+)/);
+    const chapterNum = chapterMatch ? (chapterMatch[1].replace(/^0+/, "") || "0") : "0";
     chapters.push({
-      id: match[1],
-      chapterNum: match[1].replace(/^c0*/, "").replace(/^0+/, "") || "0",
+      id: fullPath,
+      chapterNum,
       title: null,
     });
   }
@@ -218,7 +231,9 @@ export async function getFanFoxImages(
   const storeMatch = html.match(/store\/manga\/(\d+)/);
   if (!storeMatch) throw new Error("Could not extract store ID");
   const storeId = storeMatch[1];
-  const chapterFolder = chapterSlug.replace(/^c/, "").padStart(3, "0");
+  const chapterFolder = chapterSlug.match(/c([0-9.]+)/)
+    ? chapterSlug.match(/c([0-9.]+)/)![1].padStart(3, "0")
+    : chapterSlug.replace(/^c/, "").padStart(3, "0");
 
   const filenames = new Set<string>();
   let m;
