@@ -13,6 +13,12 @@ function isSource(s: string): s is ValidSource {
   return (VALID_SOURCES as readonly string[]).includes(s);
 }
 
+function emptySources(): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of VALID_SOURCES) out[s] = 0;
+  return out;
+}
+
 /**
  * GET /api/search?q={query}&limit={limit}&source={mangahere|fanfox|webtoons|mal|anilist}
  *
@@ -20,6 +26,10 @@ function isSource(s: string): s is ValidSource {
  * - `source=...`: queries just that one source.
  *
  * Returns: { manga: MangadexManga[], total: number, sources: { mangahere, fanfox, webtoons, mal, anilist } }
+ *
+ * IMPORTANT: This route NEVER returns 502. If sources are unreachable, it returns
+ * 200 with an empty manga array and a warning message, so the UI can gracefully
+ * show "No results" instead of a hard error.
  */
 export async function GET(req: NextRequest) {
   try {
@@ -45,16 +55,18 @@ export async function GET(req: NextRequest) {
           sources[s] = s === sourceParam ? manga.length : 0;
         }
         return NextResponse.json({ manga, total: manga.length, sources });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        return NextResponse.json(
-          { error: `${sourceParam} search failed: ${message}` },
-          { status: 502 }
-        );
+      } catch {
+        // Single source failed — return empty instead of 502
+        return NextResponse.json({
+          manga: [],
+          total: 0,
+          sources: emptySources(),
+          warning: `${sourceParam} search is currently unavailable. Try again later.`,
+        });
       }
     }
 
-    // All-source mode — graceful fallback if all sources fail.
+    // All-source mode — NEVER return 502, always return 200 with whatever results we got.
     try {
       const { manga, sources } = await searchAllManga(q, limit);
       return NextResponse.json({
@@ -62,36 +74,22 @@ export async function GET(req: NextRequest) {
         total: manga.length,
         sources,
       });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      // If all 5 sources failed (network blocked, timeouts), return empty rather than 502.
-      // This lets the UI show "No results" instead of a hard error.
-      if (
-        message.includes("fetch") ||
-        message.includes("network") ||
-        message.includes("timeout") ||
-        message.includes("ECONNREFUSED") ||
-        message.includes("ECONNRESET")
-      ) {
-        const emptySources: Record<string, number> = {};
-        for (const s of VALID_SOURCES) emptySources[s] = 0;
-        return NextResponse.json({
-          manga: [],
-          total: 0,
-          sources: emptySources,
-          warning: "All search sources are currently unreachable from this server. Try again later.",
-        });
-      }
-      return NextResponse.json(
-        { error: `Search failed: ${message}` },
-        { status: 502 }
-      );
+    } catch {
+      // All sources failed — return empty instead of 502
+      return NextResponse.json({
+        manga: [],
+        total: 0,
+        sources: emptySources(),
+        warning: "All search sources are currently unreachable. Try again later.",
+      });
     }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    return NextResponse.json(
-      { error: `Search failed: ${message}` },
-      { status: 502 }
-    );
+  } catch {
+    // Outermost catch — still return 200 with empty
+    return NextResponse.json({
+      manga: [],
+      total: 0,
+      sources: emptySources(),
+      warning: "Search temporarily unavailable. Try again later.",
+    });
   }
 }

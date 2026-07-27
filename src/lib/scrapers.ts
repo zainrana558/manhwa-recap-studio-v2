@@ -20,7 +20,7 @@ import type { MangadexManga } from "@/types/pipeline";
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-const FETCH_TIMEOUT_MS = 10_000; // 10s timeout for all external fetches
+const FETCH_TIMEOUT_MS = 5_000; // 5s timeout for all external fetches
 
 async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
   const controller = new AbortController();

@@ -69,24 +69,43 @@ export function SearchSection({ onResults, onSelectManga }: SearchSectionProps) 
     setLoading(true);
     setError(null);
     setHasSearched(true);
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=24`);
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `Search failed (${res.status})`);
+
+    // Retry up to 3 times with delay (handles transient 502 from server restart)
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=24`);
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || `Search failed (${res.status})`);
+        }
+        const data = await res.json();
+        const manga: MangadexManga[] = data.manga ?? [];
+        setResults(manga);
+        setSourceCounts(data.sources ?? null);
+        onResults(manga, q);
+        lastError = null;
+        break;
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error("Search failed");
+        // Retry on network/502 errors, but not on 400 (bad request)
+        if (attempt < MAX_RETRIES && (lastError.message.includes("Failed to fetch") || lastError.message.includes("502") || lastError.message.includes("fetch"))) {
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
+          continue;
+        }
+        break;
       }
-      const data = await res.json();
-      const manga: MangadexManga[] = data.manga ?? [];
-      setResults(manga);
-      setSourceCounts(data.sources ?? null);
-      onResults(manga, q);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Search failed");
+    }
+
+    if (lastError) {
+      setError(lastError.message);
       setResults([]);
       setSourceCounts(null);
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   }, [query, onResults]);
 
   // Filtered view of results based on the source filter toggle.

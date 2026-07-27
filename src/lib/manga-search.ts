@@ -9,7 +9,7 @@ import {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-const FETCH_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 5_000;
 
 async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
   const controller = new AbortController();
