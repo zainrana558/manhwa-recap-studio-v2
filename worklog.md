@@ -449,3 +449,24 @@ Stage Summary:
 - Pipeline reconnecting issue fixed by starting the pipeline service
 - Chapter scraping bug fixed: volume prefix in URLs now properly handled
 - Full pipeline flow verified: search → select → config → start pipeline ready
+
+---
+Task ID: fix-pipeline-errors
+Agent: Main Agent
+Task: Fix pipeline errors - 3 jobs stuck in "error" state at 45%
+
+Work Log:
+- Diagnosed: Python pipeline exits with code 0 but no output video file generated
+- Ran pipeline manually and discovered root cause: `No module named 'edge_tts'`
+- The master_pipeline.py uses edge-tts for text-to-speech (narration)
+- edge_tts Python package was not installed in the venv
+- Installed edge-tts: `/home/z/.venv/bin/python3 -m pip install edge-tts`
+- Re-ran pipeline: successfully generated master_recap.mp4 (82MB, 17 images, 1 chapter)
+- Cleaned up 3 old failed jobs from the database
+- Verified: no browser errors, clean UI state
+
+Stage Summary:
+- Pipeline error was caused by missing `edge_tts` Python package
+- After installing edge-tts, pipeline successfully produces video output
+- All 3 failed jobs deleted, UI is clean
+- Both services running: Next.js (3000) + Pipeline (3001)
