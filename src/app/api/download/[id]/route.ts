@@ -6,6 +6,7 @@ import { promises as fs, createReadStream } from "fs";
 import { Readable } from "stream";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 300; // Allow up to 5 minutes for large video streaming
 
 interface RangeSpec {
   start: number;
