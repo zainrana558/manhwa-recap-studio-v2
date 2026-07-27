@@ -5,6 +5,22 @@ import {
   searchWebtoons,
 } from "./scrapers";
 
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+const FETCH_TIMEOUT_MS = 10_000;
+
+async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Unified multi-source manga search.
  *
@@ -61,7 +77,7 @@ async function searchJikan(query: string, limit = 12): Promise<MangadexManga[]> 
 
   let res: Response;
   try {
-    res = await fetch(url, {
+    res = await fetchWithTimeout(url, {
       headers: { accept: "application/json" },
       cache: "no-store",
     });
@@ -189,7 +205,7 @@ async function searchAniList(query: string, limit = 12): Promise<MangadexManga[]
 
   let res: Response;
   try {
-    res = await fetch("https://graphql.anilist.co", {
+    res = await fetchWithTimeout("https://graphql.anilist.co", {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({ query: ANILIST_QUERY, variables }),

@@ -3,6 +3,9 @@ import { searchAllManga, searchSingleSource } from "@/lib/manga-search";
 
 export const dynamic = "force-dynamic";
 
+// Increase the max duration for this API route since it calls multiple external sources.
+export const maxDuration = 30;
+
 const VALID_SOURCES = ["mangahere", "fanfox", "webtoons", "mal", "anilist"] as const;
 type ValidSource = (typeof VALID_SOURCES)[number];
 
@@ -51,13 +54,39 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // All-source mode.
-    const { manga, sources } = await searchAllManga(q, limit);
-    return NextResponse.json({
-      manga,
-      total: manga.length,
-      sources,
-    });
+    // All-source mode — graceful fallback if all sources fail.
+    try {
+      const { manga, sources } = await searchAllManga(q, limit);
+      return NextResponse.json({
+        manga,
+        total: manga.length,
+        sources,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      // If all 5 sources failed (network blocked, timeouts), return empty rather than 502.
+      // This lets the UI show "No results" instead of a hard error.
+      if (
+        message.includes("fetch") ||
+        message.includes("network") ||
+        message.includes("timeout") ||
+        message.includes("ECONNREFUSED") ||
+        message.includes("ECONNRESET")
+      ) {
+        const emptySources: Record<string, number> = {};
+        for (const s of VALID_SOURCES) emptySources[s] = 0;
+        return NextResponse.json({
+          manga: [],
+          total: 0,
+          sources: emptySources,
+          warning: "All search sources are currently unreachable from this server. Try again later.",
+        });
+      }
+      return NextResponse.json(
+        { error: `Search failed: ${message}` },
+        { status: 502 }
+      );
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json(

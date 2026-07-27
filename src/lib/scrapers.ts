@@ -17,6 +17,22 @@
 import type { MangadexManga } from "@/types/pipeline";
 
 // ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+const FETCH_TIMEOUT_MS = 10_000; // 10s timeout for all external fetches
+
+async function fetchWithTimeout(url: string, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
 
@@ -42,7 +58,7 @@ export async function searchMangaHere(
   query: string,
   limit = 10
 ): Promise<MangadexManga[]> {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${MANGAHERE_BASE}/search.php?name=${encodeURIComponent(query)}`,
     { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
   );
@@ -73,7 +89,7 @@ export async function searchMangaHere(
 }
 
 export async function getMangaHereChapters(slug: string): Promise<ScrapedChapter[]> {
-  const res = await fetch(`${MANGAHERE_BASE}/manga/${slug}/`, {
+  const res = await fetchWithTimeout(`${MANGAHERE_BASE}/manga/${slug}/`, {
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
   });
   if (!res.ok) throw new Error(`MangaHere chapters ${res.status}`);
@@ -100,7 +116,7 @@ export async function getMangaHereImages(
   slug: string,
   chapterSlug: string
 ): Promise<ScrapedImage[]> {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${MANGAHERE_BASE}/manga/${slug}/${chapterSlug}/1.html`,
     { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
   );
@@ -134,7 +150,7 @@ export async function searchFanFox(
   query: string,
   limit = 10
 ): Promise<MangadexManga[]> {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${FANFOX_BASE}/search?name=${encodeURIComponent(query)}`,
     { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
   );
@@ -165,7 +181,7 @@ export async function searchFanFox(
 }
 
 export async function getFanFoxChapters(slug: string): Promise<ScrapedChapter[]> {
-  const res = await fetch(`${FANFOX_BASE}/manga/${slug}/`, {
+  const res = await fetchWithTimeout(`${FANFOX_BASE}/manga/${slug}/`, {
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
   });
   if (!res.ok) throw new Error(`FanFox chapters ${res.status}`);
@@ -192,7 +208,7 @@ export async function getFanFoxImages(
   slug: string,
   chapterSlug: string
 ): Promise<ScrapedImage[]> {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${FANFOX_BASE}/manga/${slug}/${chapterSlug}/1.html`,
     { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
   );
@@ -234,7 +250,7 @@ export async function searchWebtoons(
 ): Promise<MangadexManga[]> {
   // Webtoons search requires a headless browser or their API.
   // We use the public search endpoint that returns HTML.
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${WEBTOONS_BASE}/en/search?keyword=${encodeURIComponent(query)}&searchType=ALL`,
     {
       headers: {
@@ -294,7 +310,7 @@ export async function getWebtoonsChapters(
   // We need to find the manga's list page URL first.
   // Webtoons episode list is at /en/{genre}/{title}/list?title_no={n}
   // We try fetching the list page directly.
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${WEBTOONS_BASE}/en/fantasy/_/list?title_no=${titleNo}`,
     {
       headers: {
@@ -333,7 +349,7 @@ export async function getWebtoonsImages(
   episodeNo: number
 ): Promise<ScrapedImage[]> {
   // We need the viewer URL. We try the most common pattern.
-  const listRes = await fetch(
+  const listRes = await fetchWithTimeout(
     `${WEBTOONS_BASE}/en/fantasy/_/list?title_no=${titleNo}`,
     {
       headers: {
@@ -357,7 +373,7 @@ export async function getWebtoonsImages(
     ? viewerMatch[1]
     : `${WEBTOONS_BASE}${viewerMatch[1]}`;
 
-  const res = await fetch(viewerUrl, {
+  const res = await fetchWithTimeout(viewerUrl, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
       "Accept-Language": "en-US,en;q=0.9",
