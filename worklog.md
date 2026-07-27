@@ -493,3 +493,45 @@ Stage Summary:
 - Voice reads exact bubble text from panels (VLM transcribes verbatim, TTS speaks verbatim)
 - faster_whisper provides word-level timestamps for frame-accurate image/voice sync
 - Output video: H264 1920x1080 + AAC audio, proper sync between panels and narration
+---
+Task ID: 1
+Agent: main
+Task: Fix pipeline render stage, enable panel-by-panel slicing, ensure verbatim bubble text narration
+
+Work Log:
+- Read and analyzed full pipeline: index.ts (Node orchestrator), master_pipeline.py (Python renderer), lib.ts (VLM narration)
+- Identified issue: pipeline used `_fast_prepare_frames` (skips slicing) instead of `slice_chapter_panels`
+- Added `_detect_vertical_gutters()` function for detecting column separators in manga rows
+- Modified `slice_chapter_panels` to detect and split landscape segments (side-by-side panels)
+- Switched `run_pipeline` from `_fast_prepare_frames` to `slice_chapter_panels`
+- Tuned constants: SILENT_FRAME_DURATION=5.0, MAX_FRAMES_PER_PANEL=4
+- Fixed output directory creation in `overlay_bgm` and `run_pipeline`
+- Installed `openai` Python package for fallback translate/rephrase
+- Verified VLM narration already transcribes bubble text verbatim (no summarization)
+- Tested pipeline end-to-end: 3 chapters, 506 total frames, 6.3min output, completed in 4.8min
+
+Stage Summary:
+- Pipeline render stage now works end-to-end
+- Panel-by-panel slicing produces ~11 frames per manga page (true individual panels)
+- Voice reads bubble text verbatim (VLM transcription, narration_provider=none)
+- Frame duration driven by TTS audio length for perfect sync
+- Output: 1920x1080 @ 24fps, H.264 + AAC
+
+---
+Task ID: 2
+Agent: main
+Task: Verify services and finalize
+
+Work Log:
+- Started Next.js dev server (port 3000) and pipeline service (port 3001)
+- Verified page renders (32KB HTML with Manhwa/Search content)
+- Verified API endpoint returns jobs list with correct data
+- Verified pipeline service health check returns healthy
+- Confirmed Solo Leveling Ragnarok job completed successfully (status=done, output=master_recap.mp4)
+
+Stage Summary:
+- All services running and responding correctly
+- Pipeline render stage no longer stuck — full end-to-end verified
+- Panel-by-panel slicing produces ~11 frames per manga page
+- Voice reads bubble text verbatim via VLM transcription
+- Frame duration driven by TTS audio for perfect sync

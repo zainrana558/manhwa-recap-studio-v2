@@ -64,13 +64,13 @@ from typing import List, Optional
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
-OVERLAP_RATIO = 0.0  # No overlap — fewer frames, faster rendering
+OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
 FPS = 24  # YouTube-standard 24fps
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BITRATE = "192k"  # higher quality audio for narration
-SILENT_FRAME_DURATION = 1.4  # seconds a frame holds on screen if it has no narration text
+SILENT_FRAME_DURATION = 5.0  # seconds a frame holds on screen if it has no narration text (4-8s target)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-MAX_FRAMES_PER_PANEL = 5  # Cap frames per source panel to keep total frame count manageable
+MAX_FRAMES_PER_PANEL = 4  # Cap frames per source panel (prevents overslicing tall splash panels)
 
 # Phase 3: Audio post-processing targets (YouTube standard)
 TARGET_LOUDNESS_LUFS = -14  # YouTube's standard loudness target
@@ -386,6 +386,45 @@ def _detect_panel_gutters(img_gray, y_offset: int = 0) -> List[int]:
     return cuts
 
 
+def _detect_vertical_gutters(img_gray) -> List[int]:
+    """Detect vertical gutter lines (column separators) in a manga row.
+
+    Scans columns for uniform vertical bands — blank white gaps or thin
+    black borders between side-by-side panels. Returns sorted list of
+    absolute x-coordinates where the row should be cut vertically.
+    """
+    import cv2
+    import numpy as np
+
+    h, w = img_gray.shape
+    if w < 10:
+        return []
+
+    col_stds = np.std(img_gray, axis=0).astype(np.float32)
+    # Smooth to avoid single-column noise spikes.
+    kernel = max(1, min(5, w // 500))
+    if kernel > 1:
+        col_stds = cv2.blur(col_stds.reshape(1, -1), (1, kernel)).flatten()
+
+    # Adaptive threshold for vertical gutters.
+    gutter_threshold = float(min(14.0, max(6.0, np.percentile(col_stds, 20))))
+    is_gutter = col_stds < gutter_threshold
+
+    cuts: List[int] = []
+    run_start = None
+    min_gutter_width = max(2, w // 800)
+    for i, g in enumerate(is_gutter):
+        if g and run_start is None:
+            run_start = i
+        elif not g and run_start is not None:
+            if i - run_start >= min_gutter_width:
+                cuts.append((run_start + i) // 2)
+            run_start = None
+    if run_start is not None and w - run_start >= min_gutter_width:
+        cuts.append((run_start + w) // 2)
+    return cuts
+
+
 def _split_into_panel_segments(img_gray, max_segment_height: int) -> List[tuple]:
     """Return a list of (top, bottom) panel boundaries for a webtoon strip,
     guaranteeing no returned segment is taller than max_segment_height
@@ -553,19 +592,46 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     log.debug("[%s] inpainting skipped for img %d: %s", chapter.tag, panel_idx, e)
 
             # Slice each segment into canvas-height frames with overlap.
+            # For segments that fit in height but are wide (landscape rows
+            # with side-by-side manga panels), detect vertical gutters
+            # and split into individual panels.
             # Cap total frames per panel to MAX_FRAMES_PER_PANEL by increasing
             # the step size dynamically so rendering stays fast.
             panel_frame_count = 0
             for seg_top, seg_bot in segments:
                 seg_h = seg_bot - seg_top
+
                 if seg_h <= CANVAS_H:
-                    crop = img.crop((0, seg_top, w, seg_bot))
-                    frame = _compose_canvas(crop, ImageFilter=ImageFilter)
-                    fp = out_dir / f"frame_{frame_counter:05d}.jpg"
-                    frame.save(fp, quality=92)
-                    frame_data.append((fp, panel_idx))
-                    frame_counter += 1
-                    panel_frame_count += 1
+                    # Check for vertical gutters in landscape segments
+                    # (side-by-side panels in a manga row).
+                    sub_regions: List[tuple] = []  # (left, top, right, bottom)
+                    if seg_h < CANVAS_W * 0.7 and seg_h < CANVAS_H * 0.8:
+                        # Landscape segment — try vertical split.
+                        seg_gray = gray[seg_top:seg_bot, :]
+                        v_cuts = _detect_vertical_gutters(seg_gray)
+                        if len(v_cuts) >= 1:
+                            v_boundaries = [0] + v_cuts + [w]
+                            for vi in range(len(v_boundaries) - 1):
+                                vl, vr = v_boundaries[vi], v_boundaries[vi + 1]
+                                if vr - vl >= w * 0.1:  # skip tiny slivers
+                                    sub_regions.append((vl, seg_top, vr, seg_bot))
+                            if not sub_regions:
+                                sub_regions.append((0, seg_top, w, seg_bot))
+                        else:
+                            sub_regions.append((0, seg_top, w, seg_bot))
+                    else:
+                        sub_regions.append((0, seg_top, w, seg_bot))
+
+                    for left, top, right, bottom in sub_regions:
+                        if panel_frame_count >= MAX_FRAMES_PER_PANEL:
+                            break
+                        crop = img.crop((left, top, right, bottom))
+                        frame = _compose_canvas(crop, ImageFilter=ImageFilter)
+                        fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                        frame.save(fp, quality=92)
+                        frame_data.append((fp, panel_idx))
+                        frame_counter += 1
+                        panel_frame_count += 1
                 else:
                     # Calculate how many frames this segment would produce.
                     num_frames_needed = max(1, int((seg_h - CANVAS_H) / step) + 1)
@@ -1324,6 +1390,9 @@ def overlay_bgm(cfg: PipelineConfig, merged_path: Path) -> Path:
          returns to full volume.
       3. The ducked BGM is mixed with the narration at full volume.
     """
+    # Ensure the output directory exists before writing.
+    cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+
     if not cfg.bgm_path:
         log.info("No --bgm provided — copying merged file directly to final output")
         shutil.copy2(merged_path, cfg.output_path)
@@ -1381,6 +1450,8 @@ def cleanup_temp(cfg: PipelineConfig) -> None:
 def run_pipeline(cfg: PipelineConfig) -> None:
     start = time.time()
     cfg.ensure_dirs()
+    # Ensure the output directory exists.
+    cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     chapters = discover_chapters(cfg)
     total = len(chapters)
@@ -1406,14 +1477,14 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         # Slice returns [(frame_path, source_panel_index), ...] so we can map
         # each frame to its source image's narration for perfect sync.
-        # FAST MODE: skip slicing tall strips; use source images directly
-        # (centered on 1920x1080 canvas). Each image = 1 frame, shown for
-        # the exact duration of its narration TTS.
-        frame_data = _fast_prepare_frames(cfg, chapter)
+        # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
+        # horizontal AND vertical panel boundaries, so each manga panel
+        # gets its own individual 1920x1080 frame.
+        frame_data = slice_chapter_panels(cfg, chapter)
         frame_paths = [fp for fp, _ in frame_data]
         frame_sources = [si for _, si in frame_data]
 
-        log.info("[%s] %d frames from %d panels", chapter.tag, len(frame_paths), len(chapter.panel_paths))
+        log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
         cfg.write_progress("render", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
