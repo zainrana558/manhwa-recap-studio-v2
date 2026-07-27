@@ -52,3 +52,41 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Pipeline data (scraped images, rendered videos, work dirs — too large for git)
+/data/jobs/
+/data/bgm/*.mp3
+/data/bgm/*.wav
+/data/bgm/*.ogg
+/data/bgm/*.m4a
+
+# Mini-service dependencies
+/mini-services/*/node_modules/
+/mini-services/*/dist/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Agent context
+/agent-ctx/
+
+# Upload folder (user temp files)
+/upload/
+
+# Download folder
+/download/
+
+# Tool results
+/tool-results/
+
+# Tests
+/tests/
+
+# Worklog (internal)
+# worklog.md
+
+# Screenshots
+screenshot-*.png*.mp4
+TEMP_MPY*
