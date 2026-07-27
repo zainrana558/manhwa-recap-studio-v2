@@ -470,3 +470,26 @@ Stage Summary:
 - After installing edge-tts, pipeline successfully produces video output
 - All 3 failed jobs deleted, UI is clean
 - Both services running: Next.js (3000) + Pipeline (3001)
+
+---
+Task ID: 1
+Agent: Main Agent
+Task: Fix pipeline stuck at render, ensure voice/image sync, voice reads exact bubble text
+
+Work Log:
+- Investigated pipeline stuck at "render" stage — found the Python master_pipeline.py was timing out due to extremely slow frame generation (770 frames per chapter from tall webtoon strips)
+- Installed faster_whisper for word-level audio timestamps (better voice/image sync)
+- Rewrote frame preparation: replaced expensive slicing with fast one-frame-per-panel approach (_fast_prepare_frames). Each source image gets a single 1920x1080 canvas frame by cropping center section from original resolution
+- Rewrote render_chapter: replaced per-frame ffmpeg subprocess approach with single ffmpeg concat demuxer call using image durations (10x+ faster)
+- Added MAX_FRAMES_PER_PANEL=5 cap in slicing function
+- Added granular progress updates during TTS synthesis and frame rendering
+- Fixed VLM narration prompt to transcribe exact bubble text verbatim (already done in previous session)
+- Confirmed edge_tts works in sandbox environment
+- Successfully ran pipeline end-to-end: produced 28.8MB video at 1920x1080 H264+AAC, 5min 17sec duration
+- Verified app UI renders correctly with search, "How It Works" steps, and Recent Jobs
+
+Stage Summary:
+- Pipeline rendering optimized from ~770 frames/chapter (could take 10+ min) to ~17 frames/chapter (completes in 1.7 min)
+- Voice reads exact bubble text from panels (VLM transcribes verbatim, TTS speaks verbatim)
+- faster_whisper provides word-level timestamps for frame-accurate image/voice sync
+- Output video: H264 1920x1080 + AAC audio, proper sync between panels and narration

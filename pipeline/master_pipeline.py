@@ -64,12 +64,13 @@ from typing import List, Optional
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CANVAS_W, CANVAS_H = 1920, 1080
-OVERLAP_RATIO = 0.15
-FPS = 24  # YouTube-standard 30fps for smoother motion
+OVERLAP_RATIO = 0.0  # No overlap — fewer frames, faster rendering
+FPS = 24  # YouTube-standard 24fps
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BITRATE = "192k"  # higher quality audio for narration
 SILENT_FRAME_DURATION = 1.4  # seconds a frame holds on screen if it has no narration text
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+MAX_FRAMES_PER_PANEL = 5  # Cap frames per source panel to keep total frame count manageable
 
 # Phase 3: Audio post-processing targets (YouTube standard)
 TARGET_LOUDNESS_LUFS = -14  # YouTube's standard loudness target
@@ -243,6 +244,86 @@ def discover_chapters(cfg: PipelineConfig) -> List[Chapter]:
 
     log.info("Discovered %d chapters (%d total panel images)", len(chapters), sum(len(c.panel_paths) for c in chapters))
     return chapters
+
+
+# ---------------------------------------------------------------------------
+# 2a. FAST FRAME PREPARATION (no slicing — one frame per source image)
+# ---------------------------------------------------------------------------
+
+def _fast_prepare_frames(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
+    """Prepare one 1920x1080 canvas frame per source panel image, centered and
+    scaled to fit. This avoids the expensive slicing step for tall webtoon
+    strips. Each image gets exactly one frame that is displayed for the full
+    duration of its narration TTS, keeping voice and image perfectly in sync.
+
+    Returns list of (frame_path, source_panel_index) tuples.
+    Resumable: reuses existing frames from the slices directory."""
+    out_dir = cfg.temp_slices_dir / chapter.tag
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            data = json.loads(manifest_path.read_text())
+            frames = data["frames"]
+            sources = data.get("sources")
+            if sources and len(sources) == len(frames):
+                log.info("[%s] frames already exist (%d frames) — skipping", chapter.tag, len(frames))
+                return [(Path(f), s) for f, s in zip(frames, sources)]
+        except Exception:
+            pass
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frame_data: List[tuple] = []
+
+    for panel_idx, panel_path in enumerate(chapter.panel_paths):
+        fp = out_dir / f"frame_{panel_idx:05d}.jpg"
+        if fp.exists():
+            frame_data.append((fp, panel_idx))
+            continue
+        frame = _compose_canvas_from_source(panel_path)
+        frame.save(fp, quality=92)
+        frame_data.append((fp, panel_idx))
+
+    manifest_path.write_text(json.dumps({
+        "frames": [str(f) for f, _ in frame_data],
+        "sources": [s for _, s in frame_data],
+    }, indent=2))
+    log.info("[%s] prepared %d frames (one per source panel)", chapter.tag, len(frame_data))
+    return frame_data
+
+
+def _compose_canvas_from_source(panel_path: Path):
+    """Load a source panel image and center it on a 1920x1080 canvas.
+    For tall webtoon strips, crops the center section directly from the
+    original resolution (avoids expensive full-width resize)."""
+    from PIL import Image
+
+    img = Image.open(panel_path).convert("RGB")
+    cw, ch = img.size
+
+    if ch / cw > 1.5:
+        # Tall strip: crop center section from ORIGINAL resolution,
+        # then resize only the crop to 1920x1080. This avoids
+        # creating a 1920x33000 intermediate image.
+        crop_h = int(cw * CANVAS_H / CANVAS_W)
+        crop_top = max(0, (ch - crop_h) // 2)
+        crop_bot = min(ch, crop_top + crop_h)
+        crop = img.crop((0, crop_top, cw, crop_bot))
+        fg = crop.resize((CANVAS_W, CANVAS_H), Image.LANCZOS)
+    else:
+        # Normal aspect ratio: fit within canvas.
+        fg_scale = min(CANVAS_W / cw, CANVAS_H / ch)
+        fw, fh = max(1, int(cw * fg_scale)), max(1, int(ch * fg_scale))
+        fg = img.resize((fw, fh), Image.LANCZOS)
+
+    # Dark background.
+    canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (20, 20, 30))
+
+    # Center the image on canvas.
+    fx = (CANVAS_W - fg.width) // 2
+    fy = (CANVAS_H - fg.height) // 2
+    canvas.paste(fg, (fx, fy))
+
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +553,9 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     log.debug("[%s] inpainting skipped for img %d: %s", chapter.tag, panel_idx, e)
 
             # Slice each segment into canvas-height frames with overlap.
+            # Cap total frames per panel to MAX_FRAMES_PER_PANEL by increasing
+            # the step size dynamically so rendering stays fast.
+            panel_frame_count = 0
             for seg_top, seg_bot in segments:
                 seg_h = seg_bot - seg_top
                 if seg_h <= CANVAS_H:
@@ -481,7 +565,23 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                     frame.save(fp, quality=92)
                     frame_data.append((fp, panel_idx))
                     frame_counter += 1
+                    panel_frame_count += 1
                 else:
+                    # Calculate how many frames this segment would produce.
+                    num_frames_needed = max(1, int((seg_h - CANVAS_H) / step) + 1)
+                    remaining = MAX_FRAMES_PER_PANEL - panel_frame_count
+                    if remaining <= 1:
+                        # Already at cap — just show the top of the segment.
+                        crop = img.crop((0, seg_top, w, seg_top + CANVAS_H))
+                        frame = _compose_canvas(crop, ImageFilter=ImageFilter)
+                        fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                        frame.save(fp, quality=92)
+                        frame_data.append((fp, panel_idx))
+                        frame_counter += 1
+                        panel_frame_count += 1
+                        continue
+                    # Use larger step to fit within cap.
+                    adaptive_step = max(step, seg_h / remaining)
                     y = seg_top
                     while y < seg_bot:
                         crop_bottom = min(y + slice_height, seg_bot)
@@ -491,9 +591,10 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
                         frame.save(fp, quality=92)
                         frame_data.append((fp, panel_idx))
                         frame_counter += 1
+                        panel_frame_count += 1
                         if crop_bottom >= seg_bot:
                             break
-                        y += step
+                        y += adaptive_step
 
     manifest_path.write_text(json.dumps({
         "frames": [str(f) for f, _ in frame_data],
@@ -1081,10 +1182,9 @@ def render_chapter(
     """Render a chapter's static panel frames + per-frame narration + burned
     captions into an MP4.
 
-    Memory-efficient approach: renders each frame as a short static-image video
-    segment via a separate ffmpeg process (one at a time), then concatenates
-    all segments with stream copy. This avoids loading all frames into RAM
-    simultaneously (which caused OOM with moviepy's concatenate_videoclips).
+    FAST approach: uses ffmpeg concat demuxer with image durations, so a single
+    ffmpeg call creates the entire chapter video (instead of N separate processes).
+    This is dramatically faster than the old per-segment approach.
 
     Each frame is held on screen for exactly its own audio segment's duration
     (frame_durations), so image swaps line up precisely with the narration.
@@ -1098,55 +1198,40 @@ def render_chapter(
         log.warning("[%s] no frames to render — skipping chapter", chapter.tag)
         return None
 
-    segment_dir = cfg.temp_chapters_dir / chapter.tag
-    segment_dir.mkdir(parents=True, exist_ok=True)
-
-    # Render each frame as a short static-image video segment.
-    # One ffmpeg process per frame = low memory (unlike moviepy which loads all).
-    segment_paths: List[Path] = []
+    # Write a concat demuxer input file with per-image durations.
+    # This lets a SINGLE ffmpeg call produce the whole slideshow video.
+    concat_list = cfg.temp_chapters_dir / f"{chapter.tag}_images.txt"
     min_dur = 1.0 / FPS
-
-    for i, (fp, d) in enumerate(zip(frame_paths, frame_durations)):
-        seg_path = segment_dir / f"seg_{i:05d}.mp4"
-        if not seg_path.exists():
-            duration = max(d, min_dur)
-            # Use -loop 1 to repeat the image, -t for duration (not -frames:v
-            # which doesn't work with single-image inputs without -loop).
-            cmd = [
-                "ffmpeg", "-y",
-                "-loop", "1", "-i", str(fp),
-                "-vf", f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,crop={CANVAS_W}:{CANVAS_H}",
-                "-t", f"{duration:.3f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-r", str(FPS),
-                "-an",
-                str(seg_path),
-            ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            if result.returncode != 0:
-                log.warning("[%s] segment %d render failed: %s", chapter.tag, i, result.stdout[-200:])
-                continue
-        segment_paths.append(seg_path)
-
-    log.info("[%s] rendered %d static segments", chapter.tag, len(segment_paths))
-
-    if not segment_paths:
-        log.error("[%s] no segments rendered — skipping chapter", chapter.tag)
-        return None
-
-    # Concatenate all segments via ffmpeg concat demuxer (stream copy, fast, low memory).
-    concat_list = segment_dir / "concat_list.txt"
     with concat_list.open("w", encoding="utf-8") as f:
-        for sp in segment_paths:
-            f.write(f"file '{sp.resolve().as_posix()}'\n")
+        for i, (fp, d) in enumerate(zip(frame_paths, frame_durations)):
+            duration = max(d, min_dur)
+            # Ensure the image exists (use absolute path for concat demuxer).
+            abs_fp = fp.resolve().as_posix()
+            f.write(f"file '{abs_fp}'\n")
+            f.write(f"duration {duration:.3f}\n")
+        # ffmpeg concat demuxer needs a trailing file entry (no duration).
+        last_fp = frame_paths[-1].resolve().as_posix()
+        f.write(f"file '{last_fp}'\n")
 
+    log.info("[%s] rendering %d frames with concat demuxer", chapter.tag, len(frame_paths))
+
+    # Single ffmpeg call: slideshow from concat demuxer + scale to 1920x1080.
     silent_path = cfg.temp_chapters_dir / f"{chapter.tag}_nosubs.mp4"
-    run_ffmpeg([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+    video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,crop={CANVAS_W}:{CANVAS_H}"
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
         "-i", str(concat_list),
-        "-c", "copy",
+        "-vf", video_filters,
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
         str(silent_path),
-    ])
+    ]
+    try:
+        run_ffmpeg(cmd)
+    except RuntimeError as e:
+        log.error("[%s] concat render failed: %s", chapter.tag, e)
+        return None
 
     # Mux audio + burn captions in a single ffmpeg pass.
     if audio_path and audio_path.exists():
@@ -1155,7 +1240,7 @@ def render_chapter(
             "-i", str(silent_path),
             "-i", str(audio_path),
             "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast",
+            "-c:v", "copy",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
             "-shortest",
         ]
@@ -1168,7 +1253,7 @@ def render_chapter(
             run_ffmpeg([
                 "ffmpeg", "-y", "-i", str(silent_path),
                 "-vf", f"ass={_ffmpeg_escape_path(caption_path)}",
-                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:v", "copy",
                 "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
                 str(out_path),
             ])
@@ -1176,6 +1261,7 @@ def render_chapter(
             shutil.copy2(silent_path, out_path)
 
     silent_path.unlink(missing_ok=True)
+    concat_list.unlink(missing_ok=True)
 
     log.info("[%s] chapter video rendered -> %s", chapter.tag, out_path.name)
     return out_path
@@ -1320,9 +1406,16 @@ def run_pipeline(cfg: PipelineConfig) -> None:
 
         # Slice returns [(frame_path, source_panel_index), ...] so we can map
         # each frame to its source image's narration for perfect sync.
-        frame_data = slice_chapter_panels(cfg, chapter)
+        # FAST MODE: skip slicing tall strips; use source images directly
+        # (centered on 1920x1080 canvas). Each image = 1 frame, shown for
+        # the exact duration of its narration TTS.
+        frame_data = _fast_prepare_frames(cfg, chapter)
         frame_paths = [fp for fp, _ in frame_data]
         frame_sources = [si for _, si in frame_data]
+
+        log.info("[%s] %d frames from %d panels", chapter.tag, len(frame_paths), len(chapter.panel_paths))
+        cfg.write_progress("render", chapter.index - 1, total,
+                           f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
         # Build an ordered list of (tag, text, frame_positions) "segments" —
         # each one gets exactly ONE continuous edge-tts synthesis call, then
@@ -1375,7 +1468,9 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         segment_words: List[tuple] = []  # (word, chapter_offset_start, chapter_offset_end)
         chapter_offset = 0.0
 
-        for tag, text, positions in segments:
+        for seg_idx, (tag, text, positions) in enumerate(segments):
+            cfg.write_progress("render", chapter.index - 1, total,
+                               f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
             audio_path_seg = synthesize_segment_audio(cfg, chapter, tag, text)
             duration = get_audio_duration(audio_path_seg)
             words = transcribe_words(audio_path_seg) if text.strip() else []
@@ -1390,8 +1485,13 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         min_dur = 1.0 / FPS
         frame_durations = [max(min_dur, end - start) for start, end in frame_timing]
 
+        cfg.write_progress("render", chapter.index - 1, total,
+                           f"Chapter {chapter.index}/{total}: building audio track")
         audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
         caption_path = generate_captions(cfg, chapter, segment_words)
+
+        cfg.write_progress("render", chapter.index - 1, total,
+                           f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
         video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path, caption_path)
 
         if video_path:

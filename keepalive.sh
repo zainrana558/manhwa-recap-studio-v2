@@ -1,11 +1,13 @@
 #!/bin/bash
-# Keepalive wrapper for Next.js dev server
-# Restarts the server automatically if it crashes
-cd /home/z/my-project
+# Keep both services alive
 while true; do
-  echo "[$(date)] Starting dev server..." >> keepalive.log
-  bun --bun run dev >> dev.log 2>&1
-  EXIT_CODE=$?
-  echo "[$(date)] Server exited with code $EXIT_CODE, restarting in 2s..." >> keepalive.log
-  sleep 2
+    if ! lsof -i:3000 -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "$(date) Starting Next.js on 3000" >> /home/z/my-project/keepalive.log
+        cd /home/z/my-project && bun run dev >> /home/z/my-project/dev.log 2>&1 &
+    fi
+    if ! lsof -i:3001 -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "$(date) Starting Pipeline on 3001" >> /home/z/my-project/keepalive.log
+        cd /home/z/my-project/mini-services/pipeline-service && bun run dev >> /home/z/my-project/pipeline.log 2>&1 &
+    fi
+    sleep 5
 done
