@@ -4,7 +4,7 @@ master_pipeline.py
 ===================
 Production-grade CLI pipeline that converts a local dataset of webtoon/manhwa
 chapter images (dataset/chapter_001/, dataset/chapter_002/, ...) into a single
-master recap video with narration, word-level captions, and background music.
+master recap video with narration and background music.
 
 INPUT ASSUMPTION: You already own/control the source images and text summaries
 and have placed them locally under --input-dir. This script does NOT fetch
@@ -23,20 +23,15 @@ Expected folder layout:
 
 Pipeline stages (each resumable / skippable if output already exists):
     1. Ingestion         -> discover + sort chapter folders and panel images
-    2. Canvas slicing    -> slice tall strips into uniform 1920x1080 frames
+    2. Panel slicing     -> gutter-aware slicing into individual panel frames
     3a. Translation      -> Groq (OpenAI-compatible endpoint) translates non-English
                              chapter text to English before rewriting
     3b. Narrative rewrite-> OpenAI rephrase with cross-chapter continuity
     4. Narration TTS     -> each source panel's full narration is voiced with ONE
-                             continuous edge-tts call (no per-word chopping/seams);
-                             real word timestamps from that clip then decide how
-                             long each sliced frame stays on screen
-    5. Captions          -> faster-whisper word timestamps grouped into short
-                             phrase-level .ass subtitles (not one flashing word
-                             at a time), offset to the merged chapter audio
-    6. Chapter render    -> static-panel video per chapter, each frame's
-                             on-screen duration derived from real narration timing
-    7. Merge + BGM       -> ffmpeg concat (stream copy) + background music mix
+                             continuous edge-tts call (no per-word chopping/seams)
+    5. Chapter render    -> static-panel video per chapter, each frame's
+                             on-screen duration derived from narration timing
+    6. Merge + BGM       -> ffmpeg concat (stream copy) + background music mix
 
 Run `python master_pipeline.py --help` for CLI usage.
 """
@@ -68,7 +63,8 @@ OVERLAP_RATIO = 0.0  # No overlap — each panel gets its own clean frame
 FPS = 24  # YouTube-standard 24fps
 AUDIO_SAMPLE_RATE = 44100
 AUDIO_BITRATE = "192k"  # higher quality audio for narration
-SILENT_FRAME_DURATION = 5.0  # seconds a frame holds on screen if it has no narration text (4-8s target)
+SILENT_FRAME_DURATION = 6.0  # seconds a frame holds on screen if it has no narration text
+MIN_FRAME_DURATION = 3.0  # minimum seconds per frame — prevents panels from flashing by too fast
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 MAX_FRAMES_PER_PANEL = 4  # Cap frames per source panel (prevents overslicing tall splash panels)
 
@@ -104,16 +100,11 @@ class PipelineConfig:
     translate: bool = True
     narration_provider: str = "auto"  # auto|openai|groq|none
     narration_model: Optional[str] = None  # override model for narration
-    skip_captions: bool = False
     progress_file: Optional[Path] = None  # JSON file the Node service polls
 
     @property
     def temp_audio_dir(self) -> Path:
         return self.work_dir / "temp_audio"
-
-    @property
-    def temp_captions_dir(self) -> Path:
-        return self.work_dir / "temp_captions"
 
     @property
     def temp_chapters_dir(self) -> Path:
@@ -134,7 +125,6 @@ class PipelineConfig:
     def ensure_dirs(self) -> None:
         for d in (
             self.temp_audio_dir,
-            self.temp_captions_dir,
             self.temp_chapters_dir,
             self.temp_slices_dir,
             self.temp_scripts_dir,
@@ -1070,169 +1060,50 @@ def build_chapter_audio_track(cfg: PipelineConfig, chapter: Chapter, segment_aud
 
 
 # ---------------------------------------------------------------------------
-# 4b. FRAME TIMING FROM REAL WORD TIMESTAMPS (no re-synthesis, no seams)
+# 4b. FRAME TIMING (proportional word-count split)
 # ---------------------------------------------------------------------------
 
-_whisper_model = None
-
-
-def _get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        log.info("Loading faster-whisper model (base.en)...")
-        _whisper_model = WhisperModel("base.en", compute_type="int8")
-    return _whisper_model
-
-
-def transcribe_words(audio_path: Path) -> List[tuple]:
-    """Transcribe one continuous audio clip and return a flat list of
-    (word_text, start, end) tuples in clip-local seconds. Empty list on any
-    failure so callers can fall back to a proportional split."""
-    try:
-        model = _get_whisper_model()
-        segments, _info = model.transcribe(str(audio_path), word_timestamps=True)
-    except Exception as e:
-        log.warning("whisper transcription failed for %s (%s)", audio_path.name, e)
-        return []
-
-    words: List[tuple] = []
-    for seg in segments:
-        for w in getattr(seg, "words", None) or []:
-            text = w.word.strip()
-            if text:
-                words.append((text, float(w.start), float(w.end)))
-    return words
-
-
-def split_frame_timings(text: str, positions: List[int], duration: float, words: List[tuple]) -> dict:
-    """Given a segment's full narration text, the frame positions it spans,
-    the segment's total audio duration, and (optionally) real word-level
-    timestamps for that audio, return {position: (start, end)} clip-local
-    timing for each frame so the image swap lines up with what's actually
-    being spoken. Falls back to a proportional word-count split if
-    transcription isn't available."""
+def split_frame_timings(text: str, positions: List[int], duration: float) -> dict:
+    """Proportionally split a segment's TTS duration across its frames by
+    word count. Ensures each frame gets at least MIN_FRAME_DURATION seconds
+    so panels never flash by too fast."""
     frame_texts = split_into_segments(text, len(positions))
     word_counts = [len(t.split()) for t in frame_texts]
     total_words = sum(word_counts)
+    num_frames = len(positions)
 
     timings: dict = {}
 
-    if words and total_words > 0 and len(words) >= total_words:
-        # Walk the real transcribed words in order, assigning the same count
-        # to each frame that split_into_segments gave it textually.
-        cursor = 0
-        prev_end = 0.0
+    # Start with a proportional split.
+    cursor = 0.0
+    if total_words > 0:
         for pos, count in zip(positions, word_counts):
-            if count <= 0:
-                timings[pos] = (prev_end, prev_end)
-                continue
-            chunk = words[cursor: cursor + count]
-            cursor += count
-            start = prev_end if pos == positions[0] else chunk[0][1]
-            end = chunk[-1][2]
-            timings[pos] = (start, end)
-            prev_end = end
-        # Make sure the final frame's end reaches the true clip end so audio
-        # and video durations line up exactly (captures trailing breath/pause).
-        last_pos = positions[-1]
-        s, _ = timings[last_pos]
-        timings[last_pos] = (s, duration)
+            span = duration * (count / total_words)
+            timings[pos] = (cursor, cursor + span)
+            cursor += span
     else:
-        # Fallback: proportional split by word count (or even split if no words at all).
-        cursor = 0.0
-        if total_words > 0:
-            for pos, count in zip(positions, word_counts):
-                span = duration * (count / total_words) if total_words else 0.0
-                timings[pos] = (cursor, cursor + span)
-                cursor += span
-        else:
-            span = duration / max(1, len(positions))
-            for pos in positions:
-                timings[pos] = (cursor, cursor + span)
-                cursor += span
-        last_pos = positions[-1]
-        s, _ = timings[last_pos]
-        timings[last_pos] = (s, duration)
+        span = duration / max(1, num_frames)
+        for pos in positions:
+            timings[pos] = (cursor, cursor + span)
+            cursor += span
+
+    # Enforce MIN_FRAME_DURATION: stretch any short frame and push later ones out.
+    # Walk forward, adjusting each frame's end to be at least MIN_FRAME_DURATION
+    # from its start, then shifting subsequent starts.
+    prev_end = 0.0
+    for pos in positions:
+        start, end = timings[pos]
+        start = max(start, prev_end)  # ensure no overlap
+        if end - start < MIN_FRAME_DURATION:
+            end = start + MIN_FRAME_DURATION
+        timings[pos] = (start, end)
+        prev_end = end
 
     return timings
 
 
 # ---------------------------------------------------------------------------
-# 5. PHRASE-LEVEL CAPTION GENERATOR (faster-whisper)
-# ---------------------------------------------------------------------------
-# Captions are grouped into short natural phrases (not one word flashing at a
-# time) so they read like normal subtitles instead of a rapid-fire karaoke
-# effect on screen.
-
-CAPTION_WORDS_PER_LINE = 5  # group words into short phrases, not single flashes
-
-
-def _ass_timestamp(t: float) -> str:
-    h = int(t // 3600)
-    m = int((t % 3600) // 60)
-    s = t % 60
-    return f"{h:d}:{m:02d}:{s:05.2f}"
-
-
-ASS_HEADER = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
-WrapStyle: 0
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,58,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1.5,2,80,80,80,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-
-def generate_captions(
-    cfg: PipelineConfig,
-    chapter: Chapter,
-    segment_words: List[tuple],
-) -> Optional[Path]:
-    """Build one chapter-level .ass file from pre-transcribed, chapter-offset
-    (word, start, end) tuples, grouping consecutive words into short phrases
-    instead of showing one word at a time. `segment_words` is built once per
-    chapter in run_pipeline from the same word timestamps already produced
-    for frame-timing, so nothing is transcribed twice."""
-    out_path = cfg.temp_captions_dir / f"{chapter.tag}.ass"
-    if out_path.exists():
-        log.info("[%s] captions already exist — skipping", chapter.tag)
-        return out_path
-
-    if cfg.skip_captions:
-        log.info("[%s] --skip-captions set — skipping caption generation", chapter.tag)
-        return None
-
-    if not segment_words:
-        log.warning("[%s] no transcribed words available — skipping captions", chapter.tag)
-        return None
-
-    lines = [ASS_HEADER]
-    for i in range(0, len(segment_words), CAPTION_WORDS_PER_LINE):
-        chunk = segment_words[i: i + CAPTION_WORDS_PER_LINE]
-        if not chunk:
-            continue
-        start = _ass_timestamp(chunk[0][1])
-        end = _ass_timestamp(chunk[-1][2])
-        text = " ".join(w for w, _s, _e in chunk).strip()
-        if not text:
-            continue
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
-
-    out_path.write_text("".join(lines), encoding="utf-8")
-    log.info("[%s] phrase-level captions written -> %s", chapter.tag, out_path.name)
-    return out_path
-
-
-# ---------------------------------------------------------------------------
-# 6. CHAPTER RENDERER (static frames, memory-efficient per-segment ffmpeg)
+# 5. CHAPTER RENDERER (static frames, memory-efficient per-segment ffmpeg)
 # ---------------------------------------------------------------------------
 
 def render_chapter(
@@ -1241,10 +1112,8 @@ def render_chapter(
     frame_paths: List[Path],
     frame_durations: List[float],
     audio_path: Optional[Path],
-    caption_path: Optional[Path],
 ) -> Optional[Path]:
-    """Render a chapter's static panel frames + per-frame narration + burned
-    captions into an MP4.
+    """Render a chapter's static panel frames + per-frame narration into an MP4.
 
     FAST approach: uses ffmpeg concat demuxer with image durations, so a single
     ffmpeg call creates the entire chapter video (instead of N separate processes).
@@ -1265,82 +1134,89 @@ def render_chapter(
     # Write a concat demuxer input file with per-image durations.
     # This lets a SINGLE ffmpeg call produce the whole slideshow video.
     concat_list = cfg.temp_chapters_dir / f"{chapter.tag}_images.txt"
-    min_dur = 1.0 / FPS
     with concat_list.open("w", encoding="utf-8") as f:
         for i, (fp, d) in enumerate(zip(frame_paths, frame_durations)):
-            duration = max(d, min_dur)
             # Ensure the image exists (use absolute path for concat demuxer).
             abs_fp = fp.resolve().as_posix()
             f.write(f"file '{abs_fp}'\n")
-            f.write(f"duration {duration:.3f}\n")
+            f.write(f"duration {d:.3f}\n")
         # ffmpeg concat demuxer needs a trailing file entry (no duration).
         last_fp = frame_paths[-1].resolve().as_posix()
         f.write(f"file '{last_fp}'\n")
 
     log.info("[%s] rendering %d frames with concat demuxer", chapter.tag, len(frame_paths))
 
-    # Single ffmpeg call: slideshow from concat demuxer.
+    # Single ffmpeg call: slideshow from concat demuxer + audio mux.
     # Frames are already 1920x1080 from _compose_canvas, but ensure exact size.
     video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2"
-    silent_path = cfg.temp_chapters_dir / f"{chapter.tag}_nosubs.mp4"
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat_list),
-        "-vf", video_filters,
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-r", str(FPS),
-        str(silent_path),
-    ]
+
+    if audio_path and audio_path.exists():
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-i", str(audio_path),
+            "-vf", video_filters,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
+            "-r", str(FPS),
+            "-shortest",
+            str(out_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-vf", video_filters,
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-r", str(FPS),
+            str(out_path),
+        ]
+
     try:
         run_ffmpeg(cmd)
     except RuntimeError as e:
         log.error("[%s] concat render failed: %s", chapter.tag, e)
         return None
 
-    # Mux audio + burn captions in a single ffmpeg pass.
-    if audio_path and audio_path.exists():
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(silent_path),
-            "-i", str(audio_path),
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
-            "-shortest",
-        ]
-        if caption_path and caption_path.exists():
-            cmd[-1:-1] = ["-vf", f"ass={_ffmpeg_escape_path(caption_path)}"]
-        cmd.append(str(out_path))
-        run_ffmpeg(cmd)
-    else:
-        if caption_path and caption_path.exists():
-            run_ffmpeg([
-                "ffmpeg", "-y", "-i", str(silent_path),
-                "-vf", f"ass={_ffmpeg_escape_path(caption_path)}",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", str(AUDIO_SAMPLE_RATE),
-                str(out_path),
-            ])
-        else:
-            shutil.copy2(silent_path, out_path)
-
-    silent_path.unlink(missing_ok=True)
     concat_list.unlink(missing_ok=True)
 
     log.info("[%s] chapter video rendered -> %s", chapter.tag, out_path.name)
     return out_path
 
 
-def _ffmpeg_escape_path(p: Path) -> str:
-    # ffmpeg's ass filter needs escaped colons/backslashes on some platforms.
-    s = str(p).replace("\\", "/")
-    s = s.replace(":", r"\:")
-    return s
 
 
 # ---------------------------------------------------------------------------
-# 7. FFMPEG ZERO-REENCODE STREAM MERGER & BGM OVERLAY
+# 5b. AUDIO PADDING HELPER
+# ---------------------------------------------------------------------------
+
+def pad_audio_with_silence(audio_path: Path, target_duration: float) -> Path:
+    """If the audio is shorter than target_duration, append silence to reach it.
+    Returns the original path if already long enough, or a new padded path."""
+    current = get_audio_duration(audio_path)
+    if current >= target_duration:
+        return audio_path
+    padding_dur = target_duration - current
+    out = audio_path.with_suffix('.padded.mp3')
+    run_ffmpeg([
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
+        "-f", "lavfi", "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=mono",
+        "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+        "-t", f"{target_duration:.3f}",
+        "-ar", str(AUDIO_SAMPLE_RATE), "-b:a", AUDIO_BITRATE,
+        str(out),
+    ])
+    log.debug("Padded %s from %.1fs to %.1fs (+%.1fs silence)",
+             audio_path.name, current, target_duration, padding_dur)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 6. FFMPEG ZERO-REENCODE STREAM MERGER & BGM OVERLAY
 # ---------------------------------------------------------------------------
 
 def run_ffmpeg(cmd: List[str]) -> None:
@@ -1479,12 +1355,14 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         # PANEL-BY-PANEL MODE: use gutter-aware slicing that detects both
         # horizontal AND vertical panel boundaries, so each manga panel
         # gets its own individual 1920x1080 frame.
+        cfg.write_progress("slice", chapter.index - 1, total,
+                           f"Chapter {chapter.index}/{total}: slicing panels...")
         frame_data = slice_chapter_panels(cfg, chapter)
         frame_paths = [fp for fp, _ in frame_data]
         frame_sources = [si for _, si in frame_data]
 
         log.info("[%s] %d frames from %d panels (panel-by-panel slicing)", chapter.tag, len(frame_paths), len(chapter.panel_paths))
-        cfg.write_progress("render", chapter.index - 1, total,
+        cfg.write_progress("slice", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: sliced {len(frame_paths)} frames")
 
         # Build an ordered list of (tag, text, frame_positions) "segments" —
@@ -1531,11 +1409,11 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             prev_tail = last_sentences(narration) if narration else prev_tail
             segments.append(("chapter", narration, list(range(len(frame_paths)))))
 
-        # Synthesize one continuous clip per segment, transcribe it once, and
-        # derive per-frame timing + chapter-offset caption words from it.
+        # Synthesize one continuous clip per segment and derive per-frame timing.
+        # No whisper transcription — timing is derived purely from proportional
+        # word-count splits, with a MIN_FRAME_DURATION floor so panels don't flash by.
         frame_timing = [None] * len(frame_paths)  # position -> (start, end) clip-local to its segment
         segment_audio_paths: List[Path] = []
-        segment_words: List[tuple] = []  # (word, chapter_offset_start, chapter_offset_end)
         chapter_offset = 0.0
 
         for seg_idx, (tag, text, positions) in enumerate(segments):
@@ -1543,26 +1421,30 @@ def run_pipeline(cfg: PipelineConfig) -> None:
                                f"Chapter {chapter.index}/{total}: TTS {seg_idx+1}/{len(segments)}")
             audio_path_seg = synthesize_segment_audio(cfg, chapter, tag, text)
             duration = get_audio_duration(audio_path_seg)
-            words = transcribe_words(audio_path_seg) if text.strip() else []
-            timings = split_frame_timings(text, positions, duration, words)
+
+            # Ensure the segment audio is at least long enough for all its
+            # frames at MIN_FRAME_DURATION each. Pad with silence if needed.
+            min_total = len(positions) * MIN_FRAME_DURATION
+            if duration < min_total:
+                audio_path_seg = pad_audio_with_silence(audio_path_seg, min_total)
+                duration = min_total
+
+            timings = split_frame_timings(text, positions, duration)
             for pos in positions:
                 frame_timing[pos] = timings[pos]
-            for w_text, w_start, w_end in words:
-                segment_words.append((w_text, chapter_offset + w_start, chapter_offset + w_end))
             segment_audio_paths.append(audio_path_seg)
             chapter_offset += duration
 
-        min_dur = 1.0 / FPS
-        frame_durations = [max(min_dur, end - start) for start, end in frame_timing]
+        # Build final per-frame durations from the timings.
+        frame_durations = [end - start for start, end in frame_timing]
 
         cfg.write_progress("render", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: building audio track")
         audio_path = build_chapter_audio_track(cfg, chapter, segment_audio_paths) if segment_audio_paths else None
-        caption_path = generate_captions(cfg, chapter, segment_words)
 
         cfg.write_progress("render", chapter.index - 1, total,
                            f"Chapter {chapter.index}/{total}: rendering {len(frame_paths)} frames")
-        video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path, caption_path)
+        video_path = render_chapter(cfg, chapter, frame_paths, frame_durations, audio_path)
 
         if video_path:
             chapter_videos.append(video_path)
@@ -1635,10 +1517,6 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         help="Override the narration model name (default: openai_model or groq_model depending on provider).",
     )
     parser.add_argument(
-        "--skip-captions", action="store_true",
-        help="Skip faster-whisper caption generation entirely (faster, no model download).",
-    )
-    parser.add_argument(
         "--progress-file", type=Path, default=None,
         help="JSON file path to write progress updates to (polled by the Node orchestrator).",
     )
@@ -1686,7 +1564,6 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
         translate=not args.no_translate,
         narration_provider=args.narration_provider,
         narration_model=args.narration_model,
-        skip_captions=args.skip_captions,
         progress_file=args.progress_file,
     )
 

@@ -11,6 +11,7 @@ import {
   Search as SearchIcon,
   ScanLine,
   Eye,
+  Scissors,
   Clapperboard,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -40,6 +41,7 @@ const PIPELINE_STAGES: StageInfo[] = [
   { key: "search", label: "Search", icon: SearchIcon },
   { key: "scrape", label: "Download", icon: ScanLine },
   { key: "transcribe", label: "Transcribe", icon: Eye },
+  { key: "slice", label: "Slice", icon: Scissors },
   { key: "render", label: "Render", icon: Clapperboard },
   { key: "done", label: "Done", icon: CheckCircle2 },
 ];
@@ -52,7 +54,7 @@ function getActiveStageIndex(job: JobSummary | null): number {
     pending: 0,
     scraping: 1,
     summarizing: 2,
-    rendering: 3,
+    rendering: 4,
   };
   // All Python sub-stages (slice, narrate, tts, captions, merge, bgm)
   // map to the Render stage in the UI.
@@ -63,12 +65,12 @@ function getActiveStageIndex(job: JobSummary | null): number {
     transcribe: 2,
     translate: 2,
     slice: 3,
-    narrate: 3,
-    tts: 3,
-    captions: 3,
-    render: 3,
-    merge: 3,
-    bgm: 3,
+    narrate: 4,
+    tts: 4,
+    captions: 4,
+    render: 4,
+    merge: 4,
+    bgm: 4,
   };
   const stageIdx = job.stage ? (stageMap[job.stage] ?? -1) : -1;
   const statusIdx = job.status ? (statusMap[job.status] ?? -1) : -1;

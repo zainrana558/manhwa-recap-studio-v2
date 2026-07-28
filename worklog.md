@@ -633,3 +633,56 @@ Stage Summary:
 - All panels fully visible on screen (contain-fit, no cropping)
 - Audio syncs per panel group (narration plays during its panel's frames)
 - Download and preview both working
+---
+Task ID: 1
+Agent: main
+Task: Fix pipeline issues: add Slice stage to UI, remove Whisper transcription, fix audio-image sync and speed
+
+Work Log:
+- Read and analyzed master_pipeline.py (1725 lines), pipeline-service/index.ts, job-progress.tsx, how-it-works.tsx
+- Identified root causes:
+  1. Whisper (faster-whisper) was being used for frame timing, causing audio-image mismatch
+  2. Minimum frame duration was 1/24s (0.042s) — way too fast
+  3. No "Slice" stage in UI pipeline stages
+  4. TTS audio not padded when shorter than frame display time
+
+Changes made:
+
+### master_pipeline.py:
+- Removed ALL whisper/faster-whisper code:
+  - Removed `_whisper_model`, `_get_whisper_model()`, `transcribe_words()` functions
+  - Removed `generate_captions()`, `CAPTION_WORDS_PER_LINE`, `ASS_HEADER`, `_ass_timestamp()`
+  - Removed `_ffmpeg_escape_path()` (only used for captions)
+  - Removed `skip_captions` from PipelineConfig, `temp_captions_dir` property, and `ensure_dirs()`
+  - Removed `--skip-captions` CLI argument and its usage in `parse_args()`
+  - Updated docstring to remove whisper/caption references
+- Simplified `split_frame_timings()`: removed whisper-based timing, now uses proportional word-count split only
+- Added MIN_FRAME_DURATION = 3.0s (enforces minimum per frame so panels don't flash by)
+- Increased SILENT_FRAME_DURATION from 5.0 to 6.0 seconds
+- Added `pad_audio_with_silence()` helper: pads TTS audio with silence when shorter than minimum frame time
+- Changed slicing progress to emit "slice" stage instead of "render"
+- Simplified `render_chapter()`: removed caption_path parameter, single ffmpeg call with concat+audio
+- In TTS loop: pad short segments, compute frame_durations directly from timings (no min_dur = 1/FPS)
+
+### mini-services/pipeline-service/index.ts:
+- Removed `'--skip-captions'` from Python args
+- Added "slice" stage mapping in progress polling (40-45% range)
+
+### src/components/pipeline/job-progress.tsx:
+- Added Scissors icon import from lucide-react
+- Added "Slice" stage to PIPELINE_STAGES array (index 3, between Transcribe and Render)
+- Updated stageMap: slice→3, narrate/tts/captions/render/merge/bgm→4
+- Updated statusMap: rendering→4 (was 3)
+
+### src/components/pipeline/how-it-works.tsx:
+- Added Scissors icon import
+- Added "Slice panels" step (smart gutter detection)
+- Changed grid from 4 to 5 columns (lg:grid-cols-5)
+- Updated Render step description (removed "captioned" reference)
+
+Stage Summary:
+- Whisper transcription completely removed from pipeline
+- Slice step now visible in UI as separate pipeline stage
+- Audio-image sync fixed: proportional word-count split + 3s minimum frame duration
+- Audio padding ensures TTS never shorter than frame display time
+- Silent frames now 6 seconds instead of 5

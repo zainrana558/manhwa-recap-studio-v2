@@ -803,7 +803,6 @@ async function processJob(jobId: string): Promise<void> {
     '--work-dir', workDir(jobId),
     '--voice', job.voice,
     '--narration-provider', 'none',
-    '--skip-captions',
     '--progress-file', progressFile,
     '--keep-temp',
   ]
@@ -873,9 +872,12 @@ async function processJob(jobId: string): Promise<void> {
         status: string
         updated_at: number
       }
-      let pct = 45
+      let pct = 40
       let stage = 'render'
-      if (prog.stage === 'render') {
+      if (prog.stage === 'slice') {
+        pct = 40 + (prog.chapter_index / Math.max(1, prog.total_chapters)) * 5
+        stage = 'slice'
+      } else if (prog.stage === 'render') {
         pct = 45 + (prog.chapter_index / Math.max(1, prog.total_chapters)) * 50
         stage = 'render'
       } else if (prog.stage === 'merge') {
