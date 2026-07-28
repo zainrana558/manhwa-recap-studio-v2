@@ -1,13 +1,33 @@
 #!/bin/bash
-# Keep both services alive
+# Keep both services alive with proper duplicate detection
+PID_NEXT=""
+PID_PIPE=""
+
+start_next() {
+    cd /home/z/my-project
+    HOST=0.0.0.0 nohup bun run dev >> /home/z/my-project/dev.log 2>&1 &
+    PID_NEXT=$!
+    echo "$(date) Started Next.js PID=$PID_NEXT" >> /home/z/my-project/keepalive.log
+}
+
+start_pipe() {
+    cd /home/z/my-project/mini-services/pipeline-service
+    nohup bun --hot run index.ts >> /home/z/my-project/pipeline-service.log 2>&1 &
+    PID_PIPE=$!
+    echo "$(date) Started Pipeline PID=$PID_PIPE" >> /home/z/my-project/keepalive.log
+}
+
 while true; do
-    if ! lsof -i:3000 -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "$(date) Starting Next.js on 3000" >> /home/z/my-project/keepalive.log
-        cd /home/z/my-project && bun run dev >> /home/z/my-project/dev.log 2>&1 &
+    # Check if Next.js is actually listening
+    if ! ss -tlnp 2>/dev/null | grep -q ":3000 "; then
+        # Kill any stale process
+        [ -n "$PID_NEXT" ] && kill "$PID_NEXT" 2>/dev/null
+        start_next
     fi
-    if ! lsof -i:3001 -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "$(date) Starting Pipeline on 3001" >> /home/z/my-project/keepalive.log
-        cd /home/z/my-project/mini-services/pipeline-service && bun run dev >> /home/z/my-project/pipeline.log 2>&1 &
+    # Check if pipeline service is listening
+    if ! ss -tlnp 2>/dev/null | grep -q ":3001 "; then
+        [ -n "$PID_PIPE" ] && kill "$PID_PIPE" 2>/dev/null
+        start_pipe
     fi
-    sleep 5
+    sleep 8
 done
