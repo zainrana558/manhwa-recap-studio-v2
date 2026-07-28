@@ -559,3 +559,25 @@ Stage Summary:
 - Panel slicing: horizontal + vertical gutter detection for true panel-by-panel
 - Voice: verbatim bubble text transcription via VLM, narration_provider=none
 - Sync: frame duration = TTS audio duration per panel
+---
+Task ID: 1
+Agent: Main orchestrator
+Task: Fix VLM summary/narrate steps showing in pipeline, fix errors, fix download/preview
+
+Work Log:
+- Identified that pipeline UI showed too many stages (VLM Summary, Translate, Slice, Narrate, TTS, Captions, Merge, BGM) when actual flow is: Search → Scrape → Transcribe (VLM) → Render → Done
+- Simplified PIPELINE_STAGES in job-progress.tsx to 5 stages: Search, Download, Transcribe, Render, Done
+- Updated getActiveStageIndex to map all Python sub-stages to the "Render" UI stage
+- Renamed all "summarize" stage references to "transcribe" in pipeline-service/index.ts
+- Updated "How It Works" section from 6 steps to 4 matching the simplified pipeline
+- Cleaned up old broken jobs from DB and data directory
+- Verified pipeline service is running on port 3001
+- Verified download API route works correctly (paths resolve properly)
+- Download/preview issue was caused by old jobs having no actual output video file
+
+Stage Summary:
+- Pipeline UI now shows only: Search → Download → Transcribe → Render → Done
+- All Python sub-stages (slice, tts, captions, merge, bgm) are hidden inside "Render"
+- VLM step renamed from "summarize" to "transcribe" to accurately describe what it does (reading bubble text)
+- Old broken jobs cleaned from DB
+- Both dev server (3000) and pipeline service (3001) running

@@ -1,14 +1,12 @@
 "use client";
 
-import { Search, ScanLine, Brain, Languages, Mic2, Film, Combine } from "lucide-react";
+import { Search, ScanLine, Eye, Clapperboard } from "lucide-react";
 
 const STEPS = [
-  { icon: Search, title: "Search by name", desc: "Enter any title. We query MangaDex's free API — no URLs, no manual chapter pasting." },
-  { icon: ScanLine, title: "Scrape every chapter", desc: "Downloads all panel images from every chapter — even hundreds — automatically." },
-  { icon: Brain, title: "VLM summaries", desc: "A vision-language model reads each chapter's panels and writes an English narrative summary." },
-  { icon: Languages, title: "Translate to English", desc: "Non-English content is translated with Groq's free-tier LLM before narration." },
-  { icon: Mic2, title: "Narrate & caption", desc: "Edge-TTS voices each frame's narration; word-level captions are burned in." },
-  { icon: Film, title: "Render & merge", desc: "moviepy + ffmpeg assemble each chapter, then concat into one master recap MP4." },
+  { icon: Search, title: "Search by name", desc: "Enter any manhwa title. We query MangaDex's free API — no URLs, no manual chapter pasting." },
+  { icon: ScanLine, title: "Download panels", desc: "Downloads all panel images from every chapter — even hundreds — automatically." },
+  { icon: Eye, title: "Transcribe text", desc: "Vision AI reads speech bubbles and captions from each panel, transcribing the exact dialogue." },
+  { icon: Clapperboard, title: "Render video", desc: "Panels are sliced, voiced with TTS, captioned, and merged into a single recap MP4." },
 ];
 
 export function HowItWorks() {
@@ -17,7 +15,7 @@ export function HowItWorks() {
       <h2 className="text-center text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-6">
         How it works
       </h2>
-      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {STEPS.map((s, i) => {
           const Icon = s.icon;
           return (

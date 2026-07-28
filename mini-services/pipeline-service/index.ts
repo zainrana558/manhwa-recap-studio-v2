@@ -6,7 +6,7 @@
  *  2. HTTP internal endpoints for the Next.js API to trigger/cancel jobs.
  *  3. Job queue (one-at-a-time processing) that:
  *       a) scrapes ALL chapter images from MangaDex (rate-limited, with Referer header)
- *       b) generates per-chapter English summaries using the z-ai-web-dev-sdk VLM
+ *       b) transcribes per-image bubble/caption text using the z-ai-web-dev-sdk VLM
  *       c) spawns the Python master_pipeline.py as a subprocess
  *       d) polls progress.json and streams progress over socket.io
  *
@@ -658,14 +658,14 @@ async function processJob(jobId: string): Promise<void> {
   if (cancelledJobs.has(jobId)) return
 
   // -----------------------------
-  // Phase 2: SUMMARIZE (VLM) — per-image narration for frame-accurate sync
+  // Phase 2: TRANSCRIBE (VLM) — read bubble/caption text from each panel
   // -----------------------------
   await db.job.update({
     where: { id: jobId },
-    data: { status: 'summarizing', stage: 'summarize', message: 'Generating per-image narrations with VLM' },
+    data: { status: 'summarizing', stage: 'transcribe', message: 'Reading panel text with VLM' },
   })
   await emitStatus(jobId)
-  await emitLog(jobId, 'info', 'summarize', 'Generating per-image narrations with VLM (one narration per image for perfect sync)')
+  await emitLog(jobId, 'info', 'transcribe', 'Transcribing speech bubbles and captions from each panel image')
 
   // Reload chapters to get the latest state.
   const scrapedChapters = await db.chapter.findMany({
@@ -676,7 +676,7 @@ async function processJob(jobId: string): Promise<void> {
   let summarizedCount = 0
   for (const ch of scrapedChapters) {
     if (cancelledJobs.has(jobId)) {
-      await emitLog(jobId, 'warn', 'summarize', 'Cancelled during summarize')
+      await emitLog(jobId, 'warn', 'transcribe', 'Cancelled during transcription')
       return
     }
     const cDir = chapterDir(jobId, ch.index)
@@ -707,7 +707,7 @@ async function processJob(jobId: string): Promise<void> {
     // Skip if narration.json already exists (resume support).
     const narrationFile = path.join(cDir, 'narration.json')
     if (await fileExists(narrationFile)) {
-      await emitLog(jobId, 'info', 'summarize', `Chapter ${ch.index} narrations already cached — skipping`)
+      await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index} transcriptions already cached — skipping`)
       const updated = await db.chapter.update({
         where: { id: ch.id },
         data: { status: 'summarized', summarized: true },
@@ -718,10 +718,10 @@ async function processJob(jobId: string): Promise<void> {
     }
 
     try {
-      await emitLog(jobId, 'info', 'summarize', `Chapter ${ch.index}: narrating ${imageFiles.length} images...`)
+      await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} images...`)
       const narrations = await generateImageNarrations(imageFiles, (done, total) => {
         // Per-image progress within this chapter.
-        void emitLog(jobId, 'info', 'summarize', `Chapter ${ch.index}: ${done}/${total} images narrated`)
+        void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} images transcribed`)
       })
       // Save per-image narrations as narration.json (consumed by the Python pipeline).
       await fs.writeFile(narrationFile, JSON.stringify(narrations, null, 2), 'utf8')
@@ -738,12 +738,12 @@ async function processJob(jobId: string): Promise<void> {
       await emitLog(
         jobId,
         'success',
-        'summarize',
-        `Chapter ${ch.index} narrated: ${narrations.length} images, ${chapterSummary.length} total chars`,
+        'transcribe',
+        `Chapter ${ch.index} transcribed: ${narrations.length} images, ${chapterSummary.length} total chars`,
       )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      await emitLog(jobId, 'error', 'summarize', `Chapter ${ch.index} summarize failed: ${msg}`)
+      await emitLog(jobId, 'error', 'transcribe', `Chapter ${ch.index} transcription failed: ${msg}`)
       // Write a fallback summary so the pipeline can still proceed.
       await fs.writeFile(path.join(cDir, 'summary.txt'), 'The chapter continues the story.', 'utf8')
       const updated = await db.chapter.update({
@@ -759,8 +759,8 @@ async function processJob(jobId: string): Promise<void> {
       totalChapters: chapters.length,
       doneImages,
       totalImages,
-      stage: 'summarize',
-      message: `Summarizing chapter ${ch.index}/${scrapedChapters.length}`,
+      stage: 'transcribe',
+      message: `Transcribing chapter ${ch.index}/${scrapedChapters.length}`,
     })
   }
 
@@ -771,8 +771,8 @@ async function processJob(jobId: string): Promise<void> {
   await emitLog(
     jobId,
     'success',
-    'summarize',
-    `Summarize complete: ${summarizedCount}/${scrapedChapters.length} chapters`,
+    'transcribe',
+    `Transcription complete: ${summarizedCount}/${scrapedChapters.length} chapters`,
   )
 
   if (cancelledJobs.has(jobId)) return

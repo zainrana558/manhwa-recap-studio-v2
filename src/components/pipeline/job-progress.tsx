@@ -8,19 +8,10 @@ import {
   XCircle,
   Wifi,
   WifiOff,
-  Download,
-  Film,
   Search as SearchIcon,
-  Globe,
   ScanLine,
-  Brain,
-  Languages,
-  Mic2,
-  Scissors,
-  Captions,
+  Eye,
   Clapperboard,
-  Combine,
-  Music,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -47,33 +38,40 @@ interface StageInfo {
 
 const PIPELINE_STAGES: StageInfo[] = [
   { key: "search", label: "Search", icon: SearchIcon },
-  { key: "scrape", label: "Scrape", icon: ScanLine },
-  { key: "summarize", label: "VLM Summary", icon: Brain },
-  { key: "translate", label: "Translate", icon: Languages },
-  { key: "slice", label: "Slice", icon: Scissors },
-  { key: "narrate", label: "Narrate", icon: Mic2 },
-  { key: "tts", label: "TTS", icon: Mic2 },
-  { key: "captions", label: "Captions", icon: Captions },
+  { key: "scrape", label: "Download", icon: ScanLine },
+  { key: "transcribe", label: "Transcribe", icon: Eye },
   { key: "render", label: "Render", icon: Clapperboard },
-  { key: "merge", label: "Merge", icon: Combine },
-  { key: "bgm", label: "BGM", icon: Music },
   { key: "done", label: "Done", icon: CheckCircle2 },
 ];
 
 function getActiveStageIndex(job: JobSummary | null): number {
   if (!job) return -1;
   if (job.status === "done") return PIPELINE_STAGES.length - 1;
-  if (job.status === "error") return -1;
-  const map: Record<string, number> = {
+  if (job.status === "error" || job.status === "cancelled") return -1;
+  const statusMap: Record<string, number> = {
     pending: 0,
     scraping: 1,
     summarizing: 2,
-    translating: 3,
-    rendering: 8,
-    merging: 9,
+    rendering: 3,
   };
-  const stageIdx = job.stage ? PIPELINE_STAGES.findIndex((s) => s.key === job.stage) : -1;
-  const statusIdx = map[job.status] ?? -1;
+  // All Python sub-stages (slice, narrate, tts, captions, merge, bgm)
+  // map to the Render stage in the UI.
+  const stageMap: Record<string, number> = {
+    search: 0,
+    scrape: 1,
+    summarize: 2,
+    transcribe: 2,
+    translate: 2,
+    slice: 3,
+    narrate: 3,
+    tts: 3,
+    captions: 3,
+    render: 3,
+    merge: 3,
+    bgm: 3,
+  };
+  const stageIdx = job.stage ? (stageMap[job.stage] ?? -1) : -1;
+  const statusIdx = job.status ? (statusMap[job.status] ?? -1) : -1;
   return Math.max(stageIdx, statusIdx);
 }
 
