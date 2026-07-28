@@ -1693,17 +1693,25 @@ def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
 
 
 def check_dependencies() -> None:
-    """Fail fast with a clear message if ffmpeg isn't on PATH."""
+    """Fail fast with a clear message if required tools are missing."""
     if shutil.which("ffmpeg") is None:
         log.error("ffmpeg not found on PATH. Install it (e.g. `apt install ffmpeg` / `brew install ffmpeg`).")
         sys.exit(1)
+    try:
+        import edge_tts  # noqa: F401
+    except ImportError:
+        log.error("edge-tts not installed. Run: pip install edge-tts")
+        sys.exit(1)
 
 
-def main() -> None:
+def main() -> int:
     cfg = parse_args()
     check_dependencies()
     try:
         run_pipeline(cfg)
+        return 0
+    except SystemExit:
+        raise
     except Exception as e:
         log.error("Pipeline failed: %s", e)
         log.info(
@@ -1711,6 +1719,7 @@ def main() -> None:
             "from the last completed chapter.",
             cfg.work_dir,
         )
-   
+        return 1
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

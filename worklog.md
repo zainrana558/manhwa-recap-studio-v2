@@ -581,3 +581,26 @@ Stage Summary:
 - VLM step renamed from "summarize" to "transcribe" to accurately describe what it does (reading bubble text)
 - Old broken jobs cleaned from DB
 - Both dev server (3000) and pipeline service (3001) running
+---
+Task ID: fix-pipeline-failure
+Agent: Main orchestrator
+Task: Fix "Pipeline exited 0 but output file is missing" error
+
+Work Log:
+- Investigated failed job directory: slices existed (188 frames), scripts existed (17 image narrations + translations), but no audio was generated (temp_audio/chap_001/ was empty)
+- Manually ran Python pipeline and discovered root cause: `edge_tts` Python package was NOT installed
+- The pipeline's main() caught the ImportError exception and returned exit code 0 (silent failure), making the pipeline service think it succeeded
+- Installed edge-tts via pip3 install edge-tts
+- Re-ran the pipeline — completed successfully: 188 frames, 56MB output video
+- Fixed Python pipeline main() to return exit code 1 on failure (was always returning 0)
+- Added edge-tts dependency check in check_dependencies() so it fails fast
+- Updated job status in DB from "error" to "done"
+- Verified download API returns 200 with correct video/mp4 content type and 56MB file
+- Verified video preview loads in browser (play button enabled, controls functional)
+
+Stage Summary:
+- Root cause: edge-tts Python package missing → TTS synthesis crashed silently → no audio → no video rendered
+- Fix: pip install edge-tts + updated main() to exit(1) on failure + added dependency check
+- Output: /home/z/my-project/data/jobs/cms47y9vk0003onvn0r7dlis1/output/master_recap.mp4 (56MB)
+- Download API confirmed working (200, video/mp4, 56MB)
+- Video preview confirmed working in browser
