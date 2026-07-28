@@ -604,3 +604,32 @@ Stage Summary:
 - Output: /home/z/my-project/data/jobs/cms47y9vk0003onvn0r7dlis1/output/master_recap.mp4 (56MB)
 - Download API confirmed working (200, video/mp4, 56MB)
 - Video preview confirmed working in browser
+---
+Task ID: fix-panels-audio-sync
+Agent: Main orchestrator
+Task: Fix panels not fully visible, audio not matching panels
+
+Work Log:
+- Analyzed uploaded video and source images: source panels are 700x12172px (very tall webtoon strips)
+- Identified root cause 1: Gutter detection only found 6 cuts on 33Kpx image, merging many panels into single segments
+- Identified root cause 2: Tall segments (>1080px) were SCROLLED through with cropping, cutting off panel content
+- Identified root cause 3: 17 source images → 188 frames meant audio was spread across scrolling sub-frames, breaking sync
+- Rewrote gutter detection: multi-signal approach (row variance + brightness), better thresholds for white gaps and dark borders
+- Rewrote _split_into_panel_segments: multi-pass refinement with progressively relaxed thresholds (up to 2 passes)
+- Rewrote slice_chapter_panels: contain-fit approach — panels are scaled to FIT inside 1920x1080, nothing goes out of frame
+- For very tall panels (aspect > 2.5:1), split into sub-frames at ≤1.8:1 aspect ratio so each sub-frame fills ≥50% of canvas width
+- Changed from 188 frames (scrolling crops) to 232 frames (contain-fit sub-panels)
+- Fixed silent_path variable accidentally removed during edit
+- Changed ffmpeg filter from force_original_aspect_ratio=increase to decrease+pad to ensure contain-fit
+- Installed edge-tts (was missing, causing silent pipeline failures)
+- Updated main() to return exit code 1 on failure (was always 0)
+- Added edge-tts check in check_dependencies()
+- Verified with VLM: new frames show FULLY visible panels with readable text, no content out of frame
+- Download API confirmed working (200, 52MB, video/mp4)
+- Video preview confirmed working in browser (player functional)
+
+Stage Summary:
+- Pipeline produces 52MB video in 0.5 minutes (was 4.8 min)
+- All panels fully visible on screen (contain-fit, no cropping)
+- Audio syncs per panel group (narration plays during its panel's frames)
+- Download and preview both working

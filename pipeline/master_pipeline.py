@@ -341,16 +341,15 @@ INPAINT_MAX_BUBBLE_AREA = 150000  # px² — ignore huge regions (whole panels)
 def _detect_panel_gutters(img_gray, y_offset: int = 0) -> List[int]:
     """Detect horizontal gutter lines (panel separators) in a webtoon strip.
 
-    Uses OpenCV to find rows that are predominantly a solid, uniform band
-    (a blank white gap or a thin black border between panels). Returns a
-    sorted list of ABSOLUTE y-coordinates (relative to the original image,
-    offset by y_offset) where the strip should be cut into individual panels.
+    Uses a multi-signal approach:
+      1. Row variance (flat/uniform rows = gutters)
+      2. Row brightness (white gaps have high mean, black borders have low mean)
 
-    Uses an adaptive, percentile-based flatness threshold rather than a fixed
-    one, since JPEG compression noise can push an otherwise-blank row's
-    std-dev above any single fixed cutoff — a fixed threshold that's too
-    strict is exactly what let multiple distinct panels slip through as one
-    oversized "segment" and get crammed into a single video frame together.
+    A row is classified as gutter if it satisfies EITHER:
+      - Low variance (uniform color) AND (very bright OR very dark)
+      - Very low variance (nearly uniform regardless of color)
+
+    Returns sorted list of ABSOLUTE y-coordinates for cuts.
     """
     import cv2
     import numpy as np
@@ -359,30 +358,46 @@ def _detect_panel_gutters(img_gray, y_offset: int = 0) -> List[int]:
     if h < 10:
         return []
 
+    row_means = np.mean(img_gray, axis=1).astype(np.float32)
     row_stds = np.std(img_gray, axis=1).astype(np.float32)
-    # Smooth to avoid single-row noise spikes, but keep the kernel small
-    # enough not to blur out genuinely thin (a few px) panel borders.
-    kernel = max(1, min(5, h // 500))
-    if kernel > 1:
-        row_stds = cv2.blur(row_stds.reshape(-1, 1), (kernel, 1)).flatten()
 
-    # Adaptive threshold: the flattest ~20% of rows in THIS strip, capped to
-    # a sane absolute ceiling so busy art doesn't get treated as a gutter.
-    gutter_threshold = float(min(14.0, max(6.0, np.percentile(row_stds, 20))))
-    is_gutter = row_stds < gutter_threshold
+    # Smooth both signals to avoid single-row noise.
+    kernel = max(3, min(7, h // 300))
+    row_means = cv2.blur(row_means.reshape(-1, 1), (kernel, 1)).flatten()
+    row_stds = cv2.blur(row_stds.reshape(-1, 1), (kernel, 1)).flatten()
 
+    # Classify each row as gutter or not.
+    # Strategy: a gutter row is typically uniform (low std) AND is either
+    # very bright (white gap >200) or very dark (black border <60) or
+    # extremely uniform (std < 3 regardless of color).
+    is_bright_gutter = (row_stds < 12) & (row_means > 200)
+    is_dark_gutter = (row_stds < 12) & (row_means < 60)
+    is_flat_gutter = row_stds < 3
+    is_gutter = is_bright_gutter | is_dark_gutter | is_flat_gutter
+
+    # Extract gutter runs (consecutive gutter rows).
     cuts: List[int] = []
     run_start = None
-    min_gutter_height = max(2, h // 800)  # allow thin (a few px) borders, not just wide gaps
+    # Minimum gutter height: at least 2px, or proportional to image height.
+    min_gutter_height = max(2, h // 500)
+    # Minimum distance between cuts to avoid too many cuts close together.
+    min_panel_height = max(30, h // 100)
+
     for i, g in enumerate(is_gutter):
         if g and run_start is None:
             run_start = i
         elif not g and run_start is not None:
             if i - run_start >= min_gutter_height:
-                cuts.append(y_offset + (run_start + i) // 2)
+                cut_pos = y_offset + (run_start + i) // 2
+                # Ensure minimum panel height between cuts.
+                if not cuts or (cut_pos - cuts[-1]) >= min_panel_height:
+                    cuts.append(cut_pos)
             run_start = None
     if run_start is not None and h - run_start >= min_gutter_height:
-        cuts.append(y_offset + (run_start + h) // 2)
+        cut_pos = y_offset + (run_start + h) // 2
+        if not cuts or (cut_pos - cuts[-1]) >= min_panel_height:
+            cuts.append(cut_pos)
+
     return cuts
 
 
@@ -426,16 +441,14 @@ def _detect_vertical_gutters(img_gray) -> List[int]:
 
 
 def _split_into_panel_segments(img_gray, max_segment_height: int) -> List[tuple]:
-    """Return a list of (top, bottom) panel boundaries for a webtoon strip,
-    guaranteeing no returned segment is taller than max_segment_height
-    without at least attempting a second, more lenient detection pass on it.
+    """Return a list of (top, bottom) panel boundaries for a webtoon strip.
 
-    A single video frame is only allowed to hold ONE segment's worth of
-    content when that segment fits inside the canvas — so any segment left
-    oversized after the first pass would otherwise mean multiple story
-    panels get composited into a single frame together. This recursively
-    re-scans oversized segments (once) with a more lenient threshold before
-    giving up and treating them as one large panel/splash-page image.
+    Uses multi-pass gutter detection:
+      1. Primary pass with strict thresholds
+      2. Re-scan oversized segments (>1.5x max height) with relaxed thresholds
+      3. Re-scan still-oversized segments with very relaxed thresholds
+
+    Each segment represents one manga panel.
     """
     import numpy as np
 
@@ -445,43 +458,69 @@ def _split_into_panel_segments(img_gray, max_segment_height: int) -> List[tuple]
     segments = []
     for i in range(len(boundaries) - 1):
         top, bot = boundaries[i], boundaries[i + 1]
-        if bot - top < 50:  # skip tiny slivers (likely detection noise)
+        if bot - top < 50:
             continue
         segments.append((top, bot))
     if not segments:
         segments = [(0, h)]
 
-    # Second pass: any segment still much taller than one frame is suspicious
-    # — either a genuine full-page splash panel, or missed gutters. Re-scan
-    # just that sub-region with a more lenient (higher) threshold to try to
-    # recover any gutters the first pass missed.
+    # Recursive re-scanning of oversized segments.
+    refined = _refine_segments(img_gray, segments, max_segment_height, depth=0)
+    return refined
+
+
+def _refine_segments(img_gray, segments: List[tuple], max_height: int, depth: int) -> List[tuple]:
+    """Re-scan oversized segments with progressively relaxed thresholds."""
+    import numpy as np
+
+    if depth >= 2:  # Max 2 re-scan passes
+        return segments
+
     refined: List[tuple] = []
     for top, bot in segments:
         seg_h = bot - top
-        if seg_h > max_segment_height * 1.5:
-            sub = img_gray[top:bot, :]
-            sub_stds = np.std(sub, axis=1).astype(np.float32)
-            lenient_threshold = float(min(22.0, max(10.0, np.percentile(sub_stds, 30))))
-            is_gutter = sub_stds < lenient_threshold
-            sub_cuts: List[int] = []
-            run_start = None
-            min_h = max(2, seg_h // 800)
-            for i, g in enumerate(is_gutter):
-                if g and run_start is None:
-                    run_start = i
-                elif not g and run_start is not None:
-                    if i - run_start >= min_h:
-                        sub_cuts.append(top + (run_start + i) // 2)
-                    run_start = None
-            if run_start is not None and seg_h - run_start >= min_h:
-                sub_cuts.append(top + (run_start + seg_h) // 2)
+        if seg_h <= max_height * 1.5:
+            refined.append((top, bot))
+            continue
 
-            if sub_cuts:
-                sub_boundaries = [top] + sub_cuts + [bot]
-                for j in range(len(sub_boundaries) - 1):
-                    st, sb = sub_boundaries[j], sub_boundaries[j + 1]
-                    if sb - st >= 50:
-                        refined.append((st, sb))
+        # Re-scan this sub-region with relaxed thresholds.
+        sub = img_gray[top:bot, :]
+        sub_stds = np.std(sub, axis=1).astype(np.float32)
+        sub_means = np.mean(sub, axis=1).astype(np.float32)
+
+        kernel = max(3, min(7, seg_h // 300))
+        sub_stds = cv2.blur(sub_stds.reshape(-1, 1), (kernel, 1)).flatten()
+        sub_means = cv2.blur(sub_means.reshape(-1, 1), (kernel, 1)).flatten()
+
+        # Progressively relax the thresholds with each pass.
+        if depth == 0:
+            std_thresh = float(min(18.0, max(8.0, np.percentile(sub_stds, 25))))
+        else:
+            std_thresh = float(min(25.0, max(12.0, np.percentile(sub_stds, 35))))
+
+        is_gutter = sub_stds < std_thresh
+        sub_cuts: List[int] = []
+        run_start = None
+        min_h = max(2, seg_h // 600)
+        for i, g in enumerate(is_gutter):
+            if g and run_start is None:
+                run_start = i
+            elif not g and run_start is not None:
+                if i - run_start >= min_h:
+                    sub_cuts.append((run_start + i) // 2)
+                run_start = None
+        if run_start is not None and seg_h - run_start >= min_h:
+            sub_cuts.append((run_start + seg_h) // 2)
+
+        if sub_cuts:
+            sub_boundaries = [0] + sub_cuts + [seg_h]
+            new_segs = []
+            for j in range(len(sub_boundaries) - 1):
+                st, sb = sub_boundaries[j], sub_boundaries[j + 1]
+                if sb - st >= 50:
+                    new_segs.append((top + st, top + sb))
+            if new_segs:
+                refined.extend(_refine_segments(img_gray, new_segs, max_height, depth + 1))
                 continue
         refined.append((top, bot))
 
@@ -525,16 +564,16 @@ def _inpaint_bubbles(img) -> "object":
 
 def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     """
-    Slice each tall webtoon strip into CANVAS_W x CANVAS_H frames.
+    Slice each source image into individual panel frames.
 
-    Phase 1 of the production pipeline:
-      1. Gutter detection: scan each strip for horizontal panel separators
-         (solid color bands) and cut at those coordinates to isolate panels.
-      2. Inpainting (optional): detect speech bubbles/text and erase them
-         using OpenCV's Telea inpainting (free content-aware fill).
-      3. Frame compositing: each detected panel is centered on a blurred
-         1920x1080 canvas. Panels taller than the canvas are split with
-         overlap so no content is lost.
+    Strategy:
+      1. Detect gutter boundaries on ORIGINAL resolution
+      2. For each detected panel:
+         a. If aspect ratio is reasonable (≤2.5:1), show as ONE frame (contain-fit)
+         b. If aspect ratio is very tall (>2.5:1), split into equal-height sub-frames
+            so each sub-frame has a readable size on screen (≥50% of canvas width)
+      3. All frames use contain-fit — nothing ever goes out of frame
+      4. For landscape segments, detect vertical gutters for side-by-side panels
 
     Returns list of (frame_path, source_panel_index) tuples in order.
     Resumable: if the chapter's slice folder has a manifest, reuse it.
@@ -559,114 +598,73 @@ def slice_chapter_panels(cfg: PipelineConfig, chapter: Chapter) -> List[tuple]:
     frame_data: List[tuple] = []
     frame_counter = 0
 
-    slice_height = CANVAS_H
-    step = int(slice_height * (1 - OVERLAP_RATIO))
-
     for panel_idx, panel_path in enumerate(chapter.panel_paths):
         with Image.open(panel_path) as img:
             img = img.convert("RGB")
             w, h = img.size
 
-            # Scale to canvas width.
-            if w != CANVAS_W:
-                scale = CANVAS_W / w
-                new_h = max(1, int(h * scale))
-                img = img.resize((CANVAS_W, new_h), Image.LANCZOS)
-                w, h = img.size
-
-            # Phase 1a: Gutter detection — find panel boundaries. Uses an
-            # adaptive threshold + a recursive re-scan on any oversized
-            # segment, so multiple distinct story panels never get merged
-            # into a single video frame together.
+            # Detect gutters on ORIGINAL resolution for accuracy.
             import cv2
             import numpy as np
             gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-            segments = _split_into_panel_segments(gray, max_segment_height=CANVAS_H)
+            segments = _split_into_panel_segments(gray, max_segment_height=h * 0.6)
             log.debug("[%s] img %d: split into %d panel segment(s)", chapter.tag, panel_idx, len(segments))
 
-            # Phase 1b: Inpaint speech bubbles.
-            if INPAINT_BUBBLES:
-                try:
-                    img = _inpaint_bubbles(img)
-                except Exception as e:
-                    log.debug("[%s] inpainting skipped for img %d: %s", chapter.tag, panel_idx, e)
-
-            # Slice each segment into canvas-height frames with overlap.
-            # For segments that fit in height but are wide (landscape rows
-            # with side-by-side manga panels), detect vertical gutters
-            # and split into individual panels.
-            # Cap total frames per panel to MAX_FRAMES_PER_PANEL by increasing
-            # the step size dynamically so rendering stays fast.
-            panel_frame_count = 0
             for seg_top, seg_bot in segments:
                 seg_h = seg_bot - seg_top
+                if seg_h < 30:
+                    continue
 
-                if seg_h <= CANVAS_H:
-                    # Check for vertical gutters in landscape segments
-                    # (side-by-side panels in a manga row).
-                    sub_regions: List[tuple] = []  # (left, top, right, bottom)
-                    if seg_h < CANVAS_W * 0.7 and seg_h < CANVAS_H * 0.8:
-                        # Landscape segment — try vertical split.
-                        seg_gray = gray[seg_top:seg_bot, :]
-                        v_cuts = _detect_vertical_gutters(seg_gray)
-                        if len(v_cuts) >= 1:
-                            v_boundaries = [0] + v_cuts + [w]
-                            for vi in range(len(v_boundaries) - 1):
-                                vl, vr = v_boundaries[vi], v_boundaries[vi + 1]
-                                if vr - vl >= w * 0.1:  # skip tiny slivers
-                                    sub_regions.append((vl, seg_top, vr, seg_bot))
-                            if not sub_regions:
-                                sub_regions.append((0, seg_top, w, seg_bot))
-                        else:
-                            sub_regions.append((0, seg_top, w, seg_bot))
-                    else:
+                # Check for vertical gutters in landscape segments.
+                sub_regions: List[tuple] = []  # (left, top, right, bottom)
+                aspect = seg_h / w if w > 0 else 1
+                if aspect < 0.5:  # wide landscape segment
+                    seg_gray = gray[seg_top:seg_bot, :]
+                    v_cuts = _detect_vertical_gutters(seg_gray)
+                    if len(v_cuts) >= 1:
+                        v_boundaries = [0] + v_cuts + [w]
+                        for vi in range(len(v_boundaries) - 1):
+                            vl, vr = v_boundaries[vi], v_boundaries[vi + 1]
+                            if vr - vl >= w * 0.1:
+                                sub_regions.append((vl, seg_top, vr, seg_bot))
+                    if not sub_regions:
                         sub_regions.append((0, seg_top, w, seg_bot))
-
-                    for left, top, right, bottom in sub_regions:
-                        if panel_frame_count >= MAX_FRAMES_PER_PANEL:
-                            break
-                        crop = img.crop((left, top, right, bottom))
-                        frame = _compose_canvas(crop, ImageFilter=ImageFilter)
-                        fp = out_dir / f"frame_{frame_counter:05d}.jpg"
-                        frame.save(fp, quality=92)
-                        frame_data.append((fp, panel_idx))
-                        frame_counter += 1
-                        panel_frame_count += 1
                 else:
-                    # Calculate how many frames this segment would produce.
-                    num_frames_needed = max(1, int((seg_h - CANVAS_H) / step) + 1)
-                    remaining = MAX_FRAMES_PER_PANEL - panel_frame_count
-                    if remaining <= 1:
-                        # Already at cap — just show the top of the segment.
-                        crop = img.crop((0, seg_top, w, seg_top + CANVAS_H))
+                    sub_regions.append((0, seg_top, w, seg_bot))
+
+                for left, top, right, bottom in sub_regions:
+                    crop = img.crop((left, top, right, bottom))
+                    cw, ch = crop.size
+                    crop_aspect = ch / cw if cw > 0 else 1
+
+                    if crop_aspect <= 2.5:
+                        # Reasonable aspect ratio — one frame, contain-fit.
                         frame = _compose_canvas(crop, ImageFilter=ImageFilter)
                         fp = out_dir / f"frame_{frame_counter:05d}.jpg"
                         frame.save(fp, quality=92)
                         frame_data.append((fp, panel_idx))
                         frame_counter += 1
-                        panel_frame_count += 1
-                        continue
-                    # Use larger step to fit within cap.
-                    adaptive_step = max(step, seg_h / remaining)
-                    y = seg_top
-                    while y < seg_bot:
-                        crop_bottom = min(y + slice_height, seg_bot)
-                        crop = img.crop((0, y, w, crop_bottom))
-                        frame = _compose_canvas(crop, ImageFilter=ImageFilter)
-                        fp = out_dir / f"frame_{frame_counter:05d}.jpg"
-                        frame.save(fp, quality=92)
-                        frame_data.append((fp, panel_idx))
-                        frame_counter += 1
-                        panel_frame_count += 1
-                        if crop_bottom >= seg_bot:
-                            break
-                        y += adaptive_step
+                    else:
+                        # Very tall panel — split into sub-frames so each
+                        # sub-frame is at a readable aspect ratio (≤2:1).
+                        # This ensures each sub-frame fills ≥50% of canvas width.
+                        n_splits = max(2, int(crop_aspect / 1.8))
+                        sub_h = ch / n_splits
+                        for si in range(n_splits):
+                            sub_top = int(si * sub_h)
+                            sub_bot = min(ch, int((si + 1) * sub_h))
+                            sub_crop = crop.crop((0, sub_top, cw, sub_bot))
+                            frame = _compose_canvas(sub_crop, ImageFilter=ImageFilter)
+                            fp = out_dir / f"frame_{frame_counter:05d}.jpg"
+                            frame.save(fp, quality=92)
+                            frame_data.append((fp, panel_idx))
+                            frame_counter += 1
 
     manifest_path.write_text(json.dumps({
         "frames": [str(f) for f, _ in frame_data],
         "sources": [s for _, s in frame_data],
     }, indent=2))
-    log.info("[%s] sliced %d source panels into %d uniform frames (gutter-aware + inpainted)",
+    log.info("[%s] sliced %d source panels into %d frames (panel-by-panel, contain-fit)",
              chapter.tag, len(chapter.panel_paths), len(frame_data))
     return frame_data
 
@@ -1281,9 +1279,10 @@ def render_chapter(
 
     log.info("[%s] rendering %d frames with concat demuxer", chapter.tag, len(frame_paths))
 
-    # Single ffmpeg call: slideshow from concat demuxer + scale to 1920x1080.
+    # Single ffmpeg call: slideshow from concat demuxer.
+    # Frames are already 1920x1080 from _compose_canvas, but ensure exact size.
+    video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,pad={CANVAS_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2"
     silent_path = cfg.temp_chapters_dir / f"{chapter.tag}_nosubs.mp4"
-    video_filters = f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,crop={CANVAS_W}:{CANVAS_H}"
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
