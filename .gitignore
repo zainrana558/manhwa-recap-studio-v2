@@ -62,3 +62,9 @@ start.sh
 serve.sh
 run-all.sh
 screenshot.png
+
+# Uploads (large files)
+upload/
+
+# Work logs
+worklog.md
