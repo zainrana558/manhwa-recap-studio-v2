@@ -1,0 +1,803 @@
+     1→     1→/**
+     2→     2→ * lib.ts — shared helpers for the pipeline-service.
+     3→     3→ *
+     4→     4→ * Contains:
+     5→     5→ *  - Prisma client (single instance)
+     6→     6→ *  - Path helpers (hardcoded to the parent app's data dir)
+     7→     7→ *  - MangaDex fetch helpers (chapter pages, image download)
+     8→     8→ *  - VLM helper (z-ai-web-dev-sdk) for generating chapter summaries
+     9→     9→ *  - Small utility helpers (sleep, ensureDir, fileExists, sanitize)
+    10→    10→ */
+    11→    11→
+    12→    12→import { PrismaClient } from '@prisma/client'
+    13→    13→import { promises as fs } from 'fs'
+    14→    14→import path from 'path'
+    15→    15→
+    16→    16→// ---------------------------------------------------------------------------
+    17→    17→// Prisma — single shared client pointing at the same SQLite DB.
+    18→    18→// ---------------------------------------------------------------------------
+    19→    19→
+    20→    20→const globalForPrisma = globalThis as unknown as { pipelinePrisma: PrismaClient | undefined }
+    21→    21→
+    22→    22→export const db =
+    23→    23→  globalForPrisma.pipelinePrisma ??
+    24→    24→  new PrismaClient({
+    25→    25→    log: ['error', 'warn'],
+    26→    26→  })
+    27→    27→
+    28→    28→if (process.env.NODE_ENV !== 'production') globalForPrisma.pipelinePrisma = db
+    29→    29→
+    30→    30→// ---------------------------------------------------------------------------
+    31→    31→// Paths — hardcoded so the mini-service is decoupled from the parent app's CWD.
+    32→    32→// ---------------------------------------------------------------------------
+    33→    33→
+    34→    34→export const DATA_DIR = '/home/z/my-project/data'
+    35→    35→export const PIPELINE_SCRIPT = '/home/z/my-project/pipeline/master_pipeline.py'
+    36→    36→export const PYTHON_BIN = process.env.PYTHON_BIN || 'python3'
+    37→    37→
+    38→    38→export function jobDir(jobId: string): string {
+    39→    39→  return path.join(DATA_DIR, 'jobs', jobId)
+    40→    40→}
+    41→    41→export function datasetDir(jobId: string): string {
+    42→    42→  return path.join(jobDir(jobId), 'dataset')
+    43→    43→}
+    44→    44→export function workDir(jobId: string): string {
+    45→    45→  return path.join(jobDir(jobId), 'work')
+    46→    46→}
+    47→    47→export function outputDir(jobId: string): string {
+    48→    48→  return path.join(jobDir(jobId), 'output')
+    49→    49→}
+    50→    50→export function chapterDir(jobId: string, index: number): string {
+    51→    51→  return path.join(datasetDir(jobId), `chapter_${String(index).padStart(3, '0')}`)
+    52→    52→}
+    53→    53→export function outputVideoPath(jobId: string): string {
+    54→    54→  return path.join(outputDir(jobId), 'master_recap.mp4')
+    55→    55→}
+    56→    56→export function progressFilePath(jobId: string): string {
+    57→    57→  return path.join(jobDir(jobId), 'progress.json')
+    58→    58→}
+    59→    59→
+    60→    60→export async function ensureDir(p: string): Promise<void> {
+    61→    61→  await fs.mkdir(p, { recursive: true })
+    62→    62→}
+    63→    63→
+    64→    64→export async function fileExists(p: string): Promise<boolean> {
+    65→    65→  try {
+    66→    66→    await fs.access(p)
+    67→    67→    return true
+    68→    68→  } catch {
+    69→    69→    return false
+    70→    70→  }
+    71→    71→}
+    72→    72→
+    73→    73→export function sleep(ms: number): Promise<void> {
+    74→    74→  return new Promise((r) => setTimeout(r, ms))
+    75→    75→}
+    76→    76→
+    77→    77→// ---------------------------------------------------------------------------
+    78→    78→// Multi-source scraping helpers (MangaHere + FanFox + Webtoons).
+    79→    79→// ---------------------------------------------------------------------------
+    80→    80→
+    81→    81→// --- Source dispatchers ---
+    82→    82→
+    83→    83→export type ScraperSource = 'mangahere' | 'fanfox' | 'webtoons'
+    84→    84→
+    85→    85→export function getSourceFromId(id: string): ScraperSource | null {
+    86→    86→  if (id.startsWith('mh-')) return 'mangahere'
+    87→    87→  if (id.startsWith('ff-')) return 'fanfox'
+    88→    88→  if (id.startsWith('wt-')) return 'webtoons'
+    89→    89→  return null
+    90→    90→}
+    91→    91→
+    92→    92→export function getSlugFromId(id: string): string {
+    93→    93→  return id.replace(/^(mh-|ff-|wt-)/, '')
+    94→    94→}
+    95→    95→
+    96→    96→// --- MangaHere (mangahere.cc) ---
+    97→    97→
+    98→    98→const MANGAHERE_BASE = 'https://www.mangahere.cc'
+    99→    99→const MANGAHERE_CDN = 'https://zjcdn.mangahere.org'
+   100→   100→
+   101→   101→/**
+   102→   102→ * Fetch the chapter list for a manga from MangaHere.
+   103→   103→ * mangaId is the MangaHere slug (e.g. "solo_leveling").
+   104→   104→ * Returns chapters oldest-first.
+   105→   105→ */
+   106→   106→export async function fetchMangaHereChapters(
+   107→   107→  mangaSlug: string,
+   108→   108→  chapterLimit: number,
+   109→   109→): Promise<
+   110→   110→  Array<{
+   111→   111→    mangadexId: string // chapter slug e.g. "c001" (kept as mangadexId for DB compat)
+   112→   112→    chapterNum: string | null
+   113→   113→    title: string | null
+   114→   114→    language: string
+   115→   115→    pageCount: number
+   116→   116→    external: boolean
+   117→   117→  }>
+   118→   118→> {
+   119→   119→  const url = `${MANGAHERE_BASE}/manga/${mangaSlug}/`
+   120→   120→  const res = await fetch(url, {
+   121→   121→    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+   122→   122→  })
+   123→   123→  if (!res.ok) {
+   124→   124→    throw new Error(`MangaHere chapters ${res.status} for ${mangaSlug}`)
+   125→   125→  }
+   126→   126→  const html = await res.text()
+   127→   127→
+   128→   128→  // Parse chapter links: href="/manga/{slug}/c{chapter}/1.html"
+   129→   129→  const chapters: Array<{
+   130→   130→    mangadexId: string
+   131→   131→    chapterNum: string | null
+   132→   132→    title: string | null
+   133→   133→    language: string
+   134→   134→    pageCount: number
+   135→   135→    external: boolean
+   136→   136→  }> = []
+   137→   137→  const seen = new Set<string>()
+   138→   138→  const chapterRegex = new RegExp(
+   139→   139→    `href="/manga/${mangaSlug}/((?:v\\d+/)?c[0-9.]+)/1\\.html"`,
+   140→   140→    'gi',
+   141→   141→  )
+   142→   142→  let match
+   143→   143→  while ((match = chapterRegex.exec(html)) !== null) {
+   144→   144→    const chapSlug = match[1]
+   145→   145→    if (seen.has(chapSlug)) continue
+   146→   146→    seen.add(chapSlug)
+   147→   147→    const chapterNum = chapSlug.match(/c([0-9.]+)/) ? (chapSlug.match(/c([0-9.]+)/)![1].replace(/^0+/, '') || '0') : '0'
+   148→   148→    chapters.push({
+   149→   149→      mangadexId: chapSlug,
+   150→   150→      chapterNum,
+   151→   151→      title: null,
+   152→   152→      language: 'en',
+   153→   153→      pageCount: 0,
+   154→   154→      external: false,
+   155→   155→    })
+   156→   156→  }
+   157→   157→
+   158→   158→  // MangaHere returns newest-first; reverse to oldest-first.
+   159→   159→  chapters.reverse()
+   160→   160→
+   161→   161→  // Apply chapter limit (0 = all).
+   162→   162→  const limited = chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
+   163→   163→  return limited
+   164→   164→}
+   165→   165→
+   166→   166→/**
+   167→   167→ * Extract all image URLs for a MangaHere chapter by scraping the chapter page HTML.
+   168→   168→ *
+   169→   169→ * MangaHere loads images via obfuscated JavaScript. The image filenames are
+   170→   170→ * embedded in the HTML as pipe-separated values. We extract them and construct
+   171→   171→ * full CDN URLs.
+   172→   172→ */
+   173→   173→export async function fetchMangaHereChapterImages(
+   174→   174→  mangaSlug: string,
+   175→   175→  chapterSlug: string,
+   176→   176→): Promise<string[]> {
+   177→   177→  const url = `${MANGAHERE_BASE}/manga/${mangaSlug}/${chapterSlug}/1.html`
+   178→   178→  const res = await fetch(url, {
+   179→   179→    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+   180→   180→  })
+   181→   181→  if (!res.ok) {
+   182→   182→    throw new Error(`MangaHere chapter ${res.status} for ${mangaSlug}/${chapterSlug}`)
+   183→   183→  }
+   184→   184→  const html = await res.text()
+   185→   185→
+   186→   186→  // Extract store ID from cover image URL: store/manga/{storeId}/cover.jpg
+   187→   187→  const storeMatch = html.match(/store\/manga\/(\d+)/)
+   188→   188→  const storeId = storeMatch?.[1]
+   189→   189→  if (!storeId) {
+   190→   190→    throw new Error(`Could not extract store ID from ${url}`)
+   191→   191→  }
+   192→   192→
+   193→   193→  // Extract chapter folder from chapter slug: "v72/c700" → "700", "c001" → "001", "c200.5" → "200.5"
+   194→   194→  const chapterMatch = chapterSlug.match(/c([0-9.]+)/)
+   195→   195→  const chapterFolder = chapterMatch
+   196→   196→    ? chapterMatch[1].padStart(3, '0')
+   197→   197→    : chapterSlug.replace(/^c/, '').padStart(3, '0')
+   198→   198→
+   199→   199→  // Extract image filenames from obfuscated JavaScript.
+   200→   200→  // Pattern: {letter}{date}_{time}_{number} e.g. h20181105_144325_927
+   201→   201→  const filenameRegex = /([a-z]\d{8}_\d{6}_[a-z0-9]+)/gi
+   202→   202→  const filenames = new Set<string>()
+   203→   203→  let m
+   204→   204→  while ((m = filenameRegex.exec(html)) !== null) {
+   205→   205→    filenames.add(m[1])
+   206→   206→  }
+   207→   207→
+   208→   208→  if (filenames.size === 0) {
+   209→   209→    throw new Error(`No image filenames found in ${url}`)
+   210→   210→  }
+   211→   211→
+   212→   212→  // Construct full CDN URLs
+   213→   213→  const imageUrls = Array.from(filenames).map(
+   214→   214→    (fn) =>
+   215→   215→      `${MANGAHERE_CDN}/store/manga/${storeId}/${chapterFolder}.0/compressed/${fn}.jpg`,
+   216→   216→  )
+   217→   217→
+   218→   218→  return imageUrls
+   219→   219→}
+   220→   220→
+   221→   221→/**
+   222→   222→ * Download a single MangaHere image to disk.
+   223→   223→ * CRITICAL: MangaHere CDN requires `Referer: https://www.mangahere.cc/` header.
+   224→   224→ */
+   225→   225→export async function downloadMangaHereImage(
+   226→   226→  imageUrl: string,
+   227→   227→  destPath: string,
+   228→   228→): Promise<void> {
+   229→   229→  const res = await fetch(imageUrl, {
+   230→   230→    headers: {
+   231→   231→      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+   232→   232→      Referer: `${MANGAHERE_BASE}/`,
+   233→   233→      Accept: 'image/*',
+   234→   234→    },
+   235→   235→  })
+   236→   236→  if (!res.ok) {
+   237→   237→    throw new Error(`MangaHere image download ${res.status}: ${imageUrl}`)
+   238→   238→  }
+   239→   239→  const buf = Buffer.from(await res.arrayBuffer())
+   240→   240→  await fs.writeFile(destPath, buf)
+   241→   241→}
+   242→   242→
+   243→   243→/**
+   244→   244→ * Get the extension from a filename, e.g. "x01.jpg" -> ".jpg".
+   245→   245→ */
+   246→   246→export function extFromFilename(filename: string): string {
+   247→   247→  const m = filename.match(/\.(jpe?g|png|webp|gif)$/i)
+   248→   248→  return m ? `.${m[1].toLowerCase()}` : '.jpg'
+   249→   249→}
+   250→   250→
+   251→   251→// --- FanFox (fanfox.net) — same CMS as MangaHere, different CDN ---
+   252→   252→
+   253→   253→const FANFOX_BASE = 'https://fanfox.net'
+   254→   254→const FANFOX_CDN = 'https://fmcdn.mfcdn.net'
+   255→   255→
+   256→   256→export async function fetchFanFoxChapters(
+   257→   257→  mangaSlug: string,
+   258→   258→  chapterLimit: number,
+   259→   259→): Promise<
+   260→   260→  Array<{
+   261→   261→    mangadexId: string
+   262→   262→    chapterNum: string | null
+   263→   263→    title: string | null
+   264→   264→    language: string
+   265→   265→    pageCount: number
+   266→   266→    external: boolean
+   267→   267→  }>
+   268→   268→> {
+   269→   269→  const url = `${FANFOX_BASE}/manga/${mangaSlug}/`
+   270→   270→  const res = await fetch(url, {
+   271→   271→    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+   272→   272→  })
+   273→   273→  if (!res.ok) {
+   274→   274→    throw new Error(`FanFox chapters ${res.status} for ${mangaSlug}`)
+   275→   275→  }
+   276→   276→  const html = await res.text()
+   277→   277→
+   278→   278→  const chapters: Array<{
+   279→   279→    mangadexId: string
+   280→   280→    chapterNum: string | null
+   281→   281→    title: string | null
+   282→   282→    language: string
+   283→   283→    pageCount: number
+   284→   284→    external: boolean
+   285→   285→  }> = []
+   286→   286→  const seen = new Set<string>()
+   287→   287→  const chapterRegex = new RegExp(
+   288→   288→    `href="/manga/${mangaSlug}/((?:v\\d+/)?c[0-9.]+)/1\\.html"`,
+   289→   289→    'gi',
+   290→   290→  )
+   291→   291→  let match
+   292→   292→  while ((match = chapterRegex.exec(html)) !== null) {
+   293→   293→    const chapSlug = match[1]
+   294→   294→    if (seen.has(chapSlug)) continue
+   295→   295→    seen.add(chapSlug)
+   296→   296→    const chapterNum = chapSlug.match(/c([0-9.]+)/) ? (chapSlug.match(/c([0-9.]+)/)![1].replace(/^0+/, '') || '0') : '0'
+   297→   297→    chapters.push({
+   298→   298→      mangadexId: chapSlug,
+   299→   299→      chapterNum,
+   300→   300→      title: null,
+   301→   301→      language: 'en',
+   302→   302→      pageCount: 0,
+   303→   303→      external: false,
+   304→   304→    })
+   305→   305→  }
+   306→   306→  chapters.reverse()
+   307→   307→  return chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
+   308→   308→}
+   309→   309→
+   310→   310→export async function fetchFanFoxChapterImages(
+   311→   311→  mangaSlug: string,
+   312→   312→  chapterSlug: string,
+   313→   313→): Promise<string[]> {
+   314→   314→  const url = `${FANFOX_BASE}/manga/${mangaSlug}/${chapterSlug}/1.html`
+   315→   315→  const res = await fetch(url, {
+   316→   316→    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+   317→   317→  })
+   318→   318→  if (!res.ok) {
+   319→   319→    throw new Error(`FanFox chapter ${res.status} for ${mangaSlug}/${chapterSlug}`)
+   320→   320→  }
+   321→   321→  const html = await res.text()
+   322→   322→
+   323→   323→  const storeMatch = html.match(/store\/manga\/(\d+)/)
+   324→   324→  const storeId = storeMatch?.[1]
+   325→   325→  if (!storeId) {
+   326→   326→    throw new Error(`Could not extract store ID from ${url}`)
+   327→   327→  }
+   328→   328→  const ffChapMatch = chapterSlug.match(/c([0-9.]+)/)
+   329→   329→  const chapterFolder = ffChapMatch
+   330→   330→    ? ffChapMatch[1].padStart(3, '0')
+   331→   331→    : chapterSlug.replace(/^c/, '').padStart(3, '0')
+   332→   332→
+   333→   333→  const filenameRegex = /([a-z]\d{8}_\d{6}_[a-z0-9]+)/gi
+   334→   334→  const filenames = new Set<string>()
+   335→   335→  let m
+   336→   336→  while ((m = filenameRegex.exec(html)) !== null) {
+   337→   337→    filenames.add(m[1])
+   338→   338→  }
+   339→   339→
+   340→   340→  if (filenames.size === 0) {
+   341→   341→    throw new Error(`No image filenames found in ${url}`)
+   342→   342→  }
+   343→   343→
+   344→   344→  return Array.from(filenames).map(
+   345→   345→    (fn) =>
+   346→   346→      `${FANFOX_CDN}/store/manga/${storeId}/${chapterFolder}.0/compressed/${fn}.jpg`,
+   347→   347→  )
+   348→   348→}
+   349→   349→
+   350→   350→export async function downloadFanFoxImage(
+   351→   351→  imageUrl: string,
+   352→   352→  destPath: string,
+   353→   353→): Promise<void> {
+   354→   354→  const res = await fetch(imageUrl, {
+   355→   355→    headers: {
+   356→   356→      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+   357→   357→      Referer: `${FANFOX_BASE}/`,
+   358→   358→      Accept: 'image/*',
+   359→   359→    },
+   360→   360→  })
+   361→   361→  if (!res.ok) {
+   362→   362→    throw new Error(`FanFox image download ${res.status}: ${imageUrl}`)
+   363→   363→  }
+   364→   364→  const buf = Buffer.from(await res.arrayBuffer())
+   365→   365→  await fs.writeFile(destPath, buf)
+   366→   366→}
+   367→   367→
+   368→   368→// --- Webtoons (webtoons.com) — official manhwa/webtoons ---
+   369→   369→
+   370→   370→const WEBTOONS_BASE = 'https://www.webtoons.com'
+   371→   371→
+   372→   372→export async function fetchWebtoonsChapters(
+   373→   373→  titleNo: number,
+   374→   374→  chapterLimit: number,
+   375→   375→): Promise<
+   376→   376→  Array<{
+   377→   377→    mangadexId: string
+   378→   378→    chapterNum: string | null
+   379→   379→    title: string | null
+   380→   380→    language: string
+   381→   381→    pageCount: number
+   382→   382→    external: boolean
+   383→   383→  }>
+   384→   384→> {
+   385→   385→  const res = await fetch(
+   386→   386→    `${WEBTOONS_BASE}/en/fantasy/_/list?title_no=${titleNo}`,
+   387→   387→    {
+   388→   388→      headers: {
+   389→   389→        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+   390→   390→        'Accept-Language': 'en-US,en;q=0.9',
+   391→   391→      },
+   392→   392→      redirect: 'follow',
+   393→   393→    },
+   394→   394→  )
+   395→   395→  if (!res.ok) {
+   396→   396→    throw new Error(`Webtoons chapters ${res.status} for title_no=${titleNo}`)
+   397→   397→  }
+   398→   398→  const html = await res.text()
+   399→   399→
+   400→   400→  const chapters: Array<{
+   401→   401→    mangadexId: string
+   402→   402→    chapterNum: string | null
+   403→   403→    title: string | null
+   404→   404→    language: string
+   405→   405→    pageCount: number
+   406→   406→    external: boolean
+   407→   407→  }> = []
+   408→   408→  const seen = new Set<number>()
+   409→   409→  const regex = /href="([^"]*\/viewer\?title_no=\d+&episode_no=(\d+))"/gi
+   410→   410→  let match
+   411→   411→  while ((match = regex.exec(html)) !== null) {
+   412→   412→    const epNo = parseInt(match[2], 10)
+   413→   413→    if (seen.has(epNo)) continue
+   414→   414→    seen.add(epNo)
+   415→   415→    chapters.push({
+   416→   416→      mangadexId: `ep-${epNo}`,
+   417→   417→      chapterNum: String(epNo),
+   418→   418→      title: null,
+   419→   419→      language: 'en',
+   420→   420→      pageCount: 0,
+   421→   421→      external: false,
+   422→   422→    })
+   423→   423→  }
+   424→   424→  chapters.reverse()
+   425→   425→  return chapterLimit > 0 ? chapters.slice(0, chapterLimit) : chapters
+   426→   426→}
+   427→   427→
+   428→   428→export async function fetchWebtoonsChapterImages(
+   429→   429→  titleNo: number,
+   430→   430→  episodeNo: number,
+   431→   431→): Promise<string[]> {
+   432→   432→  // Find the viewer URL from the list page.
+   433→   433→  const listRes = await fetch(
+   434→   434→    `${WEBTOONS_BASE}/en/fantasy/_/list?title_no=${titleNo}`,
+   435→   435→    {
+   436→   436→      headers: {
+   437→   437→        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+   438→   438→        'Accept-Language': 'en-US,en;q=0.9',
+   439→   439→      },
+   440→   440→      redirect: 'follow',
+   441→   441→    },
+   442→   442→  )
+   443→   443→  if (!listRes.ok) {
+   444→   444→    throw new Error(`Webtoons list ${listRes.status}`)
+   445→   445→  }
+   446→   446→  const listHtml = await listRes.text()
+   447→   447→
+   448→   448→  const viewerRegex = new RegExp(
+   449→   449→    `href="([^"]*episode_no=${episodeNo})"`,
+   450→   450→    'i',
+   451→   451→  )
+   452→   452→  const viewerMatch = listHtml.match(viewerRegex)
+   453→   453→  if (!viewerMatch) {
+   454→   454→    throw new Error(`Episode ${episodeNo} not found for title_no=${titleNo}`)
+   455→   455→  }
+   456→   456→  const viewerUrl = viewerMatch[1].startsWith('http')
+   457→   457→    ? viewerMatch[1]
+   458→   458→    : `${WEBTOONS_BASE}${viewerMatch[1]}`
+   459→   459→
+   460→   460→  const res = await fetch(viewerUrl, {
+   461→   461→    headers: {
+   462→   462→      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+   463→   463→      'Accept-Language': 'en-US,en;q=0.9',
+   464→   464→      Referer: `${WEBTOONS_BASE}/`,
+   465→   465→    },
+   466→   466→  })
+   467→   467→  if (!res.ok) {
+   468→   468→    throw new Error(`Webtoons viewer ${res.status}`)
+   469→   469→  }
+   470→   470→  const html = await res.text()
+   471→   471→
+   472→   472→  // Webtoons embeds image URLs in data-url attributes.
+   473→   473→  const images: string[] = []
+   474→   474→  const dataUrlRegex = /data-url="(https:\/\/webtoon-phinf\.pstatic\.net\/[^"]+)"/gi
+   475→   475→  let m
+   476→   476→  while ((m = dataUrlRegex.exec(html)) !== null) {
+   477→   477→    images.push(m[1])
+   478→   478→  }
+   479→   479→
+   480→   480→  // Fallback: try src attributes.
+   481→   481→  if (images.length === 0) {
+   482→   482→    const srcRegex = /src="(https:\/\/webtoon-phinf\.pstatic\.net\/[^"]+)"/gi
+   483→   483→    while ((m = srcRegex.exec(html)) !== null) {
+   484→   484→      images.push(m[1])
+   485→   485→    }
+   486→   486→  }
+   487→   487→
+   488→   488→  return images
+   489→   489→}
+   490→   490→
+   491→   491→export async function downloadWebtoonsImage(
+   492→   492→  imageUrl: string,
+   493→   493→  destPath: string,
+   494→   494→): Promise<void> {
+   495→   495→  const res = await fetch(imageUrl, {
+   496→   496→    headers: {
+   497→   497→      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+   498→   498→      Referer: `${WEBTOONS_BASE}/`,
+   499→   499→      Accept: 'image/*',
+   500→   500→    },
+   501→   501→  })
+   502→   502→  if (!res.ok) {
+   503→   503→    throw new Error(`Webtoons image download ${res.status}: ${imageUrl}`)
+   504→   504→  }
+   505→   505→  const buf = Buffer.from(await res.arrayBuffer())
+   506→   506→  await fs.writeFile(destPath, buf)
+   507→   507→}
+   508→   508→
+   509→   509→// --- Unified dispatchers ---
+   510→   510→
+   511→   511→export async function fetchChaptersForSource(
+   512→   512→  source: ScraperSource,
+   513→   513→  mangaId: string,
+   514→   514→  chapterLimit: number,
+   515→   515→) {
+   516→   516→  const slug = getSlugFromId(mangaId)
+   517→   517→  switch (source) {
+   518→   518→    case 'mangahere':
+   519→   519→      return fetchMangaHereChapters(slug, chapterLimit)
+   520→   520→    case 'fanfox':
+   521→   521→      return fetchFanFoxChapters(slug, chapterLimit)
+   522→   522→    case 'webtoons':
+   523→   523→      return fetchWebtoonsChapters(parseInt(slug, 10), chapterLimit)
+   524→   524→  }
+   525→   525→}
+   526→   526→
+   527→   527→export async function fetchImagesForSource(
+   528→   528→  source: ScraperSource,
+   529→   529→  mangaId: string,
+   530→   530→  chapterSlug: string,
+   531→   531→): Promise<string[]> {
+   532→   532→  const slug = getSlugFromId(mangaId)
+   533→   533→  switch (source) {
+   534→   534→    case 'mangahere':
+   535→   535→      return fetchMangaHereChapterImages(slug, chapterSlug)
+   536→   536→    case 'fanfox':
+   537→   537→      return fetchFanFoxChapterImages(slug, chapterSlug)
+   538→   538→    case 'webtoons':
+   539→   539→      return fetchWebtoonsChapterImages(
+   540→   540→        parseInt(slug, 10),
+   541→   541→        parseInt(chapterSlug.replace(/^ep-/, ''), 10),
+   542→   542→      )
+   543→   543→  }
+   544→   544→}
+   545→   545→
+   546→   546→export async function downloadImageForSource(
+   547→   547→  source: ScraperSource,
+   548→   548→  imageUrl: string,
+   549→   549→  destPath: string,
+   550→   550→): Promise<void> {
+   551→   551→  switch (source) {
+   552→   552→    case 'mangahere':
+   553→   553→      return downloadMangaHereImage(imageUrl, destPath)
+   554→   554→    case 'fanfox':
+   555→   555→      return downloadFanFoxImage(imageUrl, destPath)
+   556→   556→    case 'webtoons':
+   557→   557→      return downloadWebtoonsImage(imageUrl, destPath)
+   558→   558→  }
+   559→   559→}
+   560→   560→
+   561→   561→// ---------------------------------------------------------------------------
+   562→   562→// VLM helper — generates per-chapter English summaries from scraped images.
+   563→   563→// ---------------------------------------------------------------------------
+   564→   564→
+   565→   565→let zaiPromise: Promise<unknown> | null = null
+   566→   566→
+   567→   567→async function getZai() {
+   568→   568→  // Lazy-load so the service can boot even if the SDK has issues at first run.
+   569→   569→  if (!zaiPromise) {
+   570→   570→    zaiPromise = (async () => {
+   571→   571→      const ZAI = (await import('z-ai-web-dev-sdk')).default
+   572→   572→      return await ZAI.create()
+   573→   573→    })()
+   574→   574→  }
+   575→   575→  return await zaiPromise
+   576→   576→}
+   577→   577→
+   578→   578→/**
+   579→   579→ * Generate an English narrative summary for a chapter by sampling up to 9
+   580→   580→ * images (first 3, middle 3, last 3) and asking the VLM to describe them.
+   581→   581→ *
+   582→   582→ * Falls back to a minimal summary on any error so the pipeline never blocks.
+   583→   583→ * NOTE: This is the OLD chapter-level summary. Prefer generateImageNarrations
+   584→   584→ * for per-image narration that stays in sync with the video frames.
+   585→   585→ */
+   586→   586→export async function generateChapterSummary(
+   587→   587→  imagePaths: string[],
+   588→   588→): Promise<string> {
+   589→   589→  if (imagePaths.length === 0) {
+   590→   590→    return 'The chapter continues the story.'
+   591→   591→  }
+   592→   592→
+   593→   593→  // Pick up to 9 sample images: first 3, middle 3, last 3.
+   594→   594→  const sample = pickSampleImages(imagePaths, 9)
+   595→   595→
+   596→   596→  try {
+   597→   597→    const zai = await getZai()
+   598→   598→
+   599→   599→    // Build content array: text prompt + each sample image as a base64 data URL.
+   600→   600→    const content: Array<
+   601→   601→      | { type: 'text'; text: string }
+   602→   602→      | { type: 'image_url'; image_url: { url: string } }
+   603→   603→    > = [
+   604→   604→      {
+   605→   605→        type: 'text',
+   606→   606→        text:
+   607→   607→          'You are summarizing a manhwa/manga chapter for a recap video. ' +
+   608→   608→          'Look at these panel images (ordered from the beginning, middle, and end of the chapter) ' +
+   609→   609→          'and write a detailed ENGLISH narrative summary of what happens: the events, ' +
+   610→   610→          'character actions, key dialogue, and emotional beats. ' +
+   611→   611→          'Write 3 to 6 sentences in third person, present tense, as if narrating a story. ' +
+   612→   612→          'Do not mention chapter numbers. Do not mention that you are looking at images. ' +
+   613→   613→          'Output only the summary text.',
+   614→   614→      },
+   615→   615→    ]
+   616→   616→
+   617→   617→    for (const p of sample) {
+   618→   618→      const buf = await fs.readFile(p)
+   619→   619→      const b64 = buf.toString('base64')
+   620→   620→      const mime = p.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg'
+   621→   621→      content.push({
+   622→   622→        type: 'image_url',
+   623→   623→        image_url: { url: `data:${mime};base64,${b64}` },
+   624→   624→      })
+   625→   625→    }
+   626→   626→
+   627→   627→    const zaiAny = zai as {
+   628→   628→      chat: {
+   629→   629→        completions: {
+   630→   630→          createVision: (opts: {
+   631→   631→            messages: Array<{ role: string; content: typeof content }>
+   632→   632→            thinking: { type: string }
+   633→   633→          }) => Promise<{
+   634→   634→            choices?: Array<{ message?: { content?: string } }>
+   635→   635→          }>
+   636→   636→        }
+   637→   637→      }
+   638→   638→    }
+   639→   639→
+   640→   640→    const resp = await zaiAny.chat.completions.createVision({
+   641→   641→      messages: [{ role: 'user', content }],
+   642→   642→      thinking: { type: 'disabled' },
+   643→   643→    })
+   644→   644→
+   645→   645→    const text = resp?.choices?.[0]?.message?.content?.trim()
+   646→   646→    if (text && text.length > 0) {
+   647→   647→      return text
+   648→   648→    }
+   649→   649→    return 'The chapter continues the story.'
+   650→   650→  } catch (err) {
+   651→   651→    console.error('[VLM] summary generation failed:', err)
+   652→   652→    return 'The chapter continues the story.'
+   653→   653→  }
+   654→   654→}
+   655→   655→
+   656→   656→/**
+   657→   657→ * Generate per-image narrations: send each image to the VLM individually and
+   658→   658→ * get 2-4 sentences of narration describing exactly what's in that image.
+   659→   659→ * This produces perfect sync — when the video shows image N, the narration
+   660→   660→ * describes image N.
+   661→   661→ *
+   662→   662→ * Processes images with limited concurrency (3 at a time) to balance speed
+   663→   663→ * and API load. Falls back to a generic sentence per image on any error so
+   664→   664→ * the pipeline never blocks.
+   665→   665→ *
+   666→   666→ * Returns an array of { image, text } in the same order as imagePaths.
+   667→   667→ */
+   668→   668→export async function generateImageNarrations(
+   669→   669→  imagePaths: string[],
+   670→   670→  onProgress?: (done: number, total: number) => void,
+   671→   671→): Promise<Array<{ image: string; text: string }>> {
+   672→   672→  if (imagePaths.length === 0) {
+   673→   673→    return []
+   674→   674→  }
+   675→   675→
+   676→   676→  const results: Array<{ image: string; text: string }> = new Array(imagePaths.length)
+   677→   677→  const CONCURRENCY = 3
+   678→   678→
+   679→   679→  // Process in batches of CONCURRENCY.
+   680→   680→  for (let i = 0; i < imagePaths.length; i += CONCURRENCY) {
+   681→   681→    const batch = imagePaths.slice(i, i + CONCURRENCY)
+   682→   682→    const texts = await Promise.all(
+   683→   683→      batch.map(async (imgPath, batchIdx) => {
+   684→   684→        const globalIdx = i + batchIdx
+   685→   685→        try {
+   686→   686→          const text = await narrateSingleImage(imgPath)
+   687→   687→          return text
+   688→   688→        } catch (err) {
+   689→   689→          console.error(`[VLM] image ${globalIdx + 1} narration failed:`, err)
+   690→   690→          return 'The scene continues to unfold.'
+   691→   691→        }
+   692→   692→      }),
+   693→   693→    )
+   694→   694→    for (let j = 0; j < batch.length; j++) {
+   695→   695→      const globalIdx = i + j
+   696→   696→      results[globalIdx] = {
+   697→   697→        image: path.basename(imagePaths[globalIdx]),
+   698→   698→        text: texts[j],
+   699→   699→      }
+   700→   700→    }
+   701→   701→    if (onProgress) {
+   702→   702→      onProgress(Math.min(i + CONCURRENCY, imagePaths.length), imagePaths.length)
+   703→   703→    }
+   704→   704→  }
+   705→   705→
+   706→   706→  return results
+   707→   707→}
+   708→   708→
+   709→   709→/**
+   710→   710→ * Send a single image to the VLM and get back the actual dialogue/caption
+   711→   711→ * text from its speech bubbles, thought bubbles, and caption boxes —
+   712→   712→ * transcribed as-is (translated to English), not narrated or paraphrased.
+   713→   713→ */
+   714→   714→async function narrateSingleImage(imgPath: string): Promise<string> {
+   715→   715→  const zai = await getZai()
+   716→   716→
+   717→   717→  const buf = await fs.readFile(imgPath)
+   718→   718→  const b64 = buf.toString('base64')
+   719→   719→  const ext = path.extname(imgPath).toLowerCase()
+   720→   720→  const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg'
+   721→   721→
+   722→   722→  const content: Array<
+   723→   723→    | { type: 'text'; text: string }
+   724→   724→    | { type: 'image_url'; image_url: { url: string } }
+   725→   725→  > = [
+   726→   726→    {
+   727→   727→      type: 'text',
+   728→   728→      text:
+   729→   729→        'You are a precise transcriber for a webtoon/manhwa panel, not a narrator. ' +
+   730→   730→        'Look at this single panel and transcribe ONLY the actual text you can see inside ' +
+   731→   731→        'speech bubbles, thought bubbles, and caption/narration boxes — in the order a reader ' +
+   732→   732→        'would naturally read them (top to bottom, left to right within the panel). ' +
+   733→   733→        'Translate it into natural English if it is not already in English, preserving the ' +
+   734→   734→        'original meaning and tone as closely as possible.\n\n' +
+   735→   735→        'Guidelines:\n' +
+   736→   736→        '1. Output the text VERBATIM (translated) — do not paraphrase, summarize, embellish, or ' +
+   737→   737→        'add descriptive narration around it. Do not invent dialogue that is not actually written.\n' +
+   738→   738→        '2. Do not describe the artwork, action, or characters\' expressions — only transcribe ' +
+   739→   739→        'written text that literally appears in the image.\n' +
+   740→   740→        '3. If multiple bubbles/boxes are present, join them in reading order as separate ' +
+   741→   741→        'sentences, preserving punctuation like "..." and "!" as written.\n' +
+   742→   742→        '4. Sound effect text (e.g. "BOOM", "CRASH") can be included briefly if it is the only ' +
+   743→   743→        'text present, otherwise skip pure onomatopoeia in favor of actual dialogue/captions.\n' +
+   744→   744→        '5. Never mention chapter numbers, page numbers, panels, or that you are looking at an image.\n' +
+   745→   745→        '6. If the panel has NO readable text at all (a purely visual/action panel with no bubbles ' +
+   746→   746→        'or captions), output nothing at all — an empty response. Do not invent narration to fill it.\n' +
+   747→   747→        '7. Output ONLY the transcribed (translated) text — no preamble, no headers, no markdown, ' +
+   748→   748→        'no notes about what you did.',
+   749→   749→    },
+   750→   750→    {
+   751→   751→      type: 'image_url',
+   752→   752→      image_url: { url: `data:${mime};base64,${b64}` },
+   753→   753→    },
+   754→   754→  ]
+   755→   755→
+   756→   756→  const zaiAny = zai as {
+   757→   757→    chat: {
+   758→   758→      completions: {
+   759→   759→        createVision: (opts: {
+   760→   760→          messages: Array<{ role: string; content: typeof content }>
+   761→   761→          thinking: { type: string }
+   762→   762→        }) => Promise<{
+   763→   763→          choices?: Array<{ message?: { content?: string } }>
+   764→   764→        }>
+   765→   765→      }
+   766→   766→    }
+   767→   767→  }
+   768→   768→
+   769→   769→  const resp = await zaiAny.chat.completions.createVision({
+   770→   770→    messages: [{ role: 'user', content }],
+   771→   771→    thinking: { type: 'disabled' },
+   772→   772→  })
+   773→   773→
+   774→   774→  const text = resp?.choices?.[0]?.message?.content?.trim()
+   775→   775→  // No filler fallback here on purpose: a panel with no bubbles/captions is a
+   776→   776→  // real "silent" panel (pure action/scenery), and the rest of the pipeline
+   777→   777→  // already handles empty narration correctly by holding the frame briefly
+   778→   778→  // with silence instead of narrating something that was never written.
+   779→   779→  return text ?? ''
+   780→   780→}
+   781→   781→
+   782→   782→/**
+   783→   783→ * Pick up to `maxCount` sample images from a sorted list: first N, middle N, last N.
+   784→   784→ */
+   785→   785→function pickSampleImages(paths: string[], maxCount: number): string[] {
+   786→   786→  if (paths.length <= maxCount) return paths.slice()
+   787→   787→  const n = Math.floor(maxCount / 3)
+   788→   788→  const first = paths.slice(0, n)
+   789→   789→  const midStart = Math.floor(paths.length / 2) - Math.floor(n / 2)
+   790→   790→  const middle = paths.slice(midStart, midStart + n)
+   791→   791→  const last = paths.slice(paths.length - n)
+   792→   792→  // Dedupe in case of overlap on small arrays.
+   793→   793→  const seen = new Set<string>()
+   794→   794→  const out: string[] = []
+   795→   795→  for (const p of [...first, ...middle, ...last]) {
+   796→   796→    if (!seen.has(p)) {
+   797→   797→      seen.add(p)
+   798→   798→      out.push(p)
+   799→   799→    }
+   800→   800→  }
+   801→   801→  return out.slice(0, maxCount)
+   802→   802→}
+   803→   803→

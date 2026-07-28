@@ -1,0 +1,1110 @@
+     1→/**
+     2→ * index.ts — Master Recap Pipeline mini-service (port 3001).
+     3→ *
+     4→ * Responsibilities:
+     5→ *  1. socket.io server on path `/` (required by Caddy gateway).
+     6→ *  2. HTTP internal endpoints for the Next.js API to trigger/cancel jobs.
+     7→ *  3. Job queue (one-at-a-time processing) that:
+     8→ *       a) scrapes ALL chapter images from MangaDex (rate-limited, with Referer header)
+     9→ *       b) transcribes per-image bubble/caption text using the z-ai-web-dev-sdk VLM
+    10→ *       c) spawns the Python master_pipeline.py as a subprocess
+    11→ *       d) polls progress.json and streams progress over socket.io
+    12→ *
+    13→ * The frontend connects via `io("/?XTransformPort=3001")`.
+    14→ * The Next.js API triggers via `POST http://localhost:3001/internal/start`.
+    15→ */
+    16→
+    17→import { createServer, IncomingMessage, ServerResponse } from 'http'
+    18→import { Server, Socket } from 'socket.io'
+    19→import { spawn, ChildProcess } from 'child_process'
+    20→import { promises as fs } from 'fs'
+    21→import path from 'path'
+    22→
+    23→import {
+    24→  db,
+    25→  ensureDir,
+    26→  chapterDir,
+    27→  datasetDir,
+    28→  workDir,
+    29→  outputDir,
+    30→  outputVideoPath,
+    31→  progressFilePath,
+    32→  jobDir,
+    33→  PIPELINE_SCRIPT,
+    34→  PYTHON_BIN,
+    35→  getSourceFromId,
+    36→  fetchChaptersForSource,
+    37→  fetchImagesForSource,
+    38→  downloadImageForSource,
+    39→  extFromFilename,
+    40→  generateChapterSummary,
+    41→  generateImageNarrations,
+    42→  sleep,
+    43→  fileExists,
+    44→} from './lib'
+    45→import { isR2Configured, uploadFileToR2 } from './r2'
+    46→
+    47→// ---------------------------------------------------------------------------
+    48→// Constants
+    49→// ---------------------------------------------------------------------------
+    50→
+    51→const PORT = 3001
+    52→
+    53→// ---------------------------------------------------------------------------
+    54→// HTTP server + socket.io
+    55→//
+    56→// IMPORTANT: socket.io is configured with `path: '/'` (required by the Caddy
+    57→// gateway — the frontend connects via `io("/?XTransformPort=3001")`). With
+    58→// path `/`, engine.io's attach() wrapper claims ALL HTTP requests, including
+    59→// our `/internal/*` endpoints. To work around this, we install an engine.io
+    60→// middleware that intercepts `/internal/*` requests and routes them to our
+    61→// HTTP handler before engine.io processes them.
+    62→// ---------------------------------------------------------------------------
+    63→
+    64→async function httpHandler(req: IncomingMessage, res: ServerResponse) {
+    65→  // CORS pre-flight
+    66→  res.setHeader('Access-Control-Allow-Origin', '*')
+    67→  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    68→  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    69→  if (req.method === 'OPTIONS') {
+    70→    res.writeHead(204)
+    71→    res.end()
+    72→    return
+    73→  }
+    74→
+    75→  const url = (req.url || '/').split('?')[0]
+    76→
+    77→  // Collect request body for POSTs.
+    78→  const body = await readBody(req)
+    79→
+    80→  if (req.method === 'GET' && url === '/internal/health') {
+    81→    sendJson(res, 200, { ok: true, port: PORT, queue: queueState() })
+    82→    return
+    83→  }
+    84→
+    85→  if (req.method === 'POST' && url === '/internal/start') {
+    86→    const { jobId } = body as { jobId?: string }
+    87→    if (!jobId) {
+    88→      sendJson(res, 400, { error: 'jobId required' })
+    89→      return
+    90→    }
+    91→    const job = await db.job.findUnique({ where: { id: jobId } })
+    92→    if (!job) {
+    93→      sendJson(res, 404, { error: 'job not found' })
+    94→      return
+    95→    }
+    96→    enqueueJob(jobId)
+    97→    sendJson(res, 202, { ok: true, jobId, queued: true })
+    98→    return
+    99→  }
+   100→
+   101→  if (req.method === 'POST' && url === '/internal/cancel') {
+   102→    const { jobId } = body as { jobId?: string }
+   103→    if (!jobId) {
+   104→      sendJson(res, 400, { error: 'jobId required' })
+   105→      return
+   106→    }
+   107→    await cancelJob(jobId)
+   108→    sendJson(res, 200, { ok: true, jobId, cancelled: true })
+   109→    return
+   110→  }
+   111→
+   112→  sendJson(res, 404, { error: 'not found' })
+   113→}
+   114→
+   115→const httpServer = createServer((req, res) => {
+   116→  // This listener only runs if socket.io's engine.io middleware doesn't
+   117→  // intercept first. In practice, engine.io claims everything (path "/"),
+   118→  // so this fallback is only hit if engine.io is bypassed. We keep it as a
+   119→  // safety net.
+   120→  void httpHandler(req, res)
+   121→})
+   122→
+   123→const io = new Server(httpServer, {
+   124→  path: '/',
+   125→  cors: { origin: '*', methods: ['GET', 'POST', 'OPTIONS'] },
+   126→  pingTimeout: 60000,
+   127→  pingInterval: 25000,
+   128→})
+   129→
+   130→// Intercept /internal/* requests BEFORE engine.io processes them, since
+   131→// `path: '/'` makes engine.io claim every URL.
+   132→io.engine.use((req: any, res: any, next: any) => {
+   133→  const reqUrl: string = req.url || '/'
+   134→  const urlPath = reqUrl.split('?')[0]
+   135→  if (urlPath.startsWith('/internal/')) {
+   136→    void httpHandler(req, res)
+   137→    // Do NOT call next() — we handled it.
+   138→    return
+   139→  }
+   140→  next()
+   141→})
+   142→
+   143→// ---------------------------------------------------------------------------
+   144→// Socket.io connection handling
+   145→// ---------------------------------------------------------------------------
+   146→
+   147→io.on('connection', (socket: Socket) => {
+   148→  console.log(`[io] connected ${socket.id}`)
+   149→
+   150→  socket.on('subscribe', async (payload: unknown) => {
+   151→    const jobId = extractJobId(payload)
+   152→    if (!jobId) return
+   153→    const room = `job:${jobId}`
+   154→    await socket.join(room)
+   155→    socket.emit('subscribed', { type: 'subscribed', jobId })
+   156→    // Immediately emit current status + recent logs.
+   157→    await emitStatus(jobId)
+   158→    await emitRecentLogs(jobId, socket)
+   159→  })
+   160→
+   161→  socket.on('unsubscribe', async (payload: unknown) => {
+   162→    const jobId = extractJobId(payload)
+   163→    if (!jobId) return
+   164→    await socket.leave(`job:${jobId}`)
+   165→  })
+   166→
+   167→  socket.on('cancel', async (payload: unknown) => {
+   168→    const jobId = extractJobId(payload)
+   169→    if (!jobId) return
+   170→    await cancelJob(jobId)
+   171→  })
+   172→
+   173→  socket.on('disconnect', () => {
+   174→    // rooms are auto-cleaned
+   175→  })
+   176→})
+   177→
+   178→function extractJobId(payload: unknown): string | null {
+   179→  if (!payload) return null
+   180→  if (typeof payload === 'string') return payload
+   181→  if (typeof payload === 'object') {
+   182→    const p = payload as { jobId?: string }
+   183→    if (typeof p.jobId === 'string') return p.jobId
+   184→  }
+   185→  return null
+   186→}
+   187→
+   188→// ---------------------------------------------------------------------------
+   189→// Emit helpers
+   190→// ---------------------------------------------------------------------------
+   191→
+   192→async function emitStatus(jobId: string): Promise<void> {
+   193→  const job = await loadJobSummary(jobId)
+   194→  if (!job) return
+   195→  io.to(`job:${jobId}`).emit('status', { type: 'status', job })
+   196→}
+   197→
+   198→async function emitLog(
+   199→  jobId: string,
+   200→  level: 'info' | 'warn' | 'error' | 'success',
+   201→  stage: string | null,
+   202→  message: string,
+   203→): Promise<void> {
+   204→  const log = await db.jobLog.create({
+   205→    data: { jobId, level, stage, message },
+   206→  })
+   207→  const entry = {
+   208→    id: log.id,
+   209→    jobId: log.jobId,
+   210→    level: log.level as 'info' | 'warn' | 'error' | 'success',
+   211→    stage: log.stage,
+   212→    message: log.message,
+   213→    createdAt: log.createdAt.toISOString(),
+   214→  }
+   215→  io.to(`job:${jobId}`).emit('log', { type: 'log', log: entry })
+   216→
+   217→  // Also update Job.message so subscribers get it on next status poll.
+   218→  await db.job.update({
+   219→    where: { id: jobId },
+   220→    data: { message: message.slice(0, 500), stage: stage ?? undefined },
+   221→  }).catch(() => undefined)
+   222→}
+   223→
+   224→async function emitProgress(
+   225→  jobId: string,
+   226→  fields: {
+   227→    progress: number
+   228→    doneChapters: number
+   229→    totalChapters: number
+   230→    doneImages: number
+   231→    totalImages: number
+   232→    stage: string
+   233→    message: string
+   234→  },
+   235→): Promise<void> {
+   236→  await db.job.update({
+   237→    where: { id: jobId },
+   238→    data: {
+   239→      progress: Math.max(0, Math.min(100, Math.round(fields.progress))),
+   240→      doneChapters: fields.doneChapters,
+   241→      totalChapters: fields.totalChapters,
+   242→      doneImages: fields.doneImages,
+   243→      totalImages: fields.totalImages,
+   244→      stage: fields.stage,
+   245→      message: fields.message.slice(0, 500),
+   246→    },
+   247→  }).catch(() => undefined)
+   248→
+   249→  io.to(`job:${jobId}`).emit('progress', {
+   250→    type: 'progress',
+   251→    jobId,
+   252→    progress: Math.max(0, Math.min(100, Math.round(fields.progress))),
+   253→    doneChapters: fields.doneChapters,
+   254→    totalChapters: fields.totalChapters,
+   255→    doneImages: fields.doneImages,
+   256→    totalImages: fields.totalImages,
+   257→    stage: fields.stage,
+   258→    message: fields.message,
+   259→  })
+   260→}
+   261→
+   262→async function emitChapter(jobId: string, chapter: {
+   263→  id: string
+   264→  jobId: string
+   265→  index: number
+   266→  mangadexId: string
+   267→  chapterNum: string | null
+   268→  title: string | null
+   269→  language: string
+   270→  pageCount: number
+   271→  translated: boolean
+   272→  summarized: boolean
+   273→  rendered: boolean
+   274→  folder: string
+   275→  status: string
+   276→  error: string | null
+   277→}): Promise<void> {
+   278→  io.to(`job:${jobId}`).emit('chapter', {
+   279→    type: 'chapter',
+   280→    jobId,
+   281→    chapter: {
+   282→      index: chapter.index,
+   283→      mangadexId: chapter.mangadexId,
+   284→      chapterNum: chapter.chapterNum,
+   285→      title: chapter.title,
+   286→      language: chapter.language,
+   287→      pageCount: chapter.pageCount,
+   288→      translated: chapter.translated,
+   289→      summarized: chapter.summarized,
+   290→      rendered: chapter.rendered,
+   291→      status: chapter.status,
+   292→      error: chapter.error,
+   293→    },
+   294→  })
+   295→}
+   296→
+   297→async function emitRecentLogs(jobId: string, socket: Socket): Promise<void> {
+   298→  const logs = await db.jobLog.findMany({
+   299→    where: { jobId },
+   300→    orderBy: { createdAt: 'desc' },
+   301→    take: 50,
+   302→  })
+   303→  for (const log of logs.reverse()) {
+   304→    socket.emit('log', {
+   305→      type: 'log',
+   306→      log: {
+   307→        id: log.id,
+   308→        jobId: log.jobId,
+   309→        level: log.level as 'info' | 'warn' | 'error' | 'success',
+   310→        stage: log.stage,
+   311→        message: log.message,
+   312→        createdAt: log.createdAt.toISOString(),
+   313→      },
+   314→    })
+   315→  }
+   316→}
+   317→
+   318→// ---------------------------------------------------------------------------
+   319→// DB -> JobSummary mapping
+   320→// ---------------------------------------------------------------------------
+   321→
+   322→async function loadJobSummary(jobId: string) {
+   323→  const job = await db.job.findUnique({
+   324→    where: { id: jobId },
+   325→    include: { chapters: { orderBy: { index: 'asc' } } },
+   326→  })
+   327→  if (!job) return null
+   328→  return {
+   329→    id: job.id,
+   330→    mangaId: job.mangaId,
+   331→    mangaTitle: job.mangaTitle,
+   332→    coverUrl: job.coverUrl,
+   333→    language: job.language,
+   334→    sourceLang: job.sourceLang,
+   335→    status: job.status as any,
+   336→    progress: job.progress,
+   337→    stage: job.stage,
+   338→    message: job.message,
+   339→    totalChapters: job.totalChapters,
+   340→    doneChapters: job.doneChapters,
+   341→    totalImages: job.totalImages,
+   342→    doneImages: job.doneImages,
+   343→    outputDir: job.outputDir,
+   344→    outputVideo: job.outputVideo,
+   345→    error: job.error,
+   346→    voice: job.voice,
+   347→    chapterLimit: job.chapterLimit,
+   348→    translate: job.translate,
+   349→    createdAt: job.createdAt.toISOString(),
+   350→    updatedAt: job.updatedAt.toISOString(),
+   351→    chapters: job.chapters.map((c) => ({
+   352→      index: c.index,
+   353→      mangadexId: c.mangadexId,
+   354→      chapterNum: c.chapterNum,
+   355→      title: c.title,
+   356→      language: c.language,
+   357→      pageCount: c.pageCount,
+   358→      translated: c.translated,
+   359→      summarized: c.summarized,
+   360→      rendered: c.rendered,
+   361→      status: c.status,
+   362→      error: c.error,
+   363→    })),
+   364→  }
+   365→}
+   366→
+   367→// ---------------------------------------------------------------------------
+   368→// Job queue (one at a time)
+   369→// ---------------------------------------------------------------------------
+   370→
+   371→const queue: string[] = []
+   372→let currentlyRunning: string | null = null
+   373→const childProcesses = new Map<string, ChildProcess>()
+   374→const cancelledJobs = new Set<string>()
+   375→
+   376→function queueState() {
+   377→  return {
+   378→    queueLength: queue.length,
+   379→    currentlyRunning,
+   380→    cancelled: Array.from(cancelledJobs),
+   381→  }
+   382→}
+   383→
+   384→function enqueueJob(jobId: string) {
+   385→  if (queue.includes(jobId) || currentlyRunning === jobId) return
+   386→  queue.push(jobId)
+   387→  void processQueue()
+   388→}
+   389→
+   390→async function processQueue() {
+   391→  if (currentlyRunning) return
+   392→  const next = queue.shift()
+   393→  if (!next) return
+   394→  currentlyRunning = next
+   395→  try {
+   396→    await processJob(next)
+   397→  } catch (err) {
+   398→    console.error(`[queue] processJob threw for ${next}:`, err)
+   399→    try {
+   400→      await db.job.update({
+   401→        where: { id: next },
+   402→        data: {
+   403→          status: 'error',
+   404→          error: err instanceof Error ? err.message : String(err),
+   405→        },
+   406→      })
+   407→      io.to(`job:${next}`).emit('error', {
+   408→        type: 'error',
+   409→        jobId: next,
+   410→        error: err instanceof Error ? err.message : String(err),
+   411→      })
+   412→    } catch {
+   413→      // ignore
+   414→    }
+   415→  } finally {
+   416→    currentlyRunning = null
+   417→    cancelledJobs.delete(next)
+   418→    // Process the next queued job (if any).
+   419→    void processQueue()
+   420→  }
+   421→}
+   422→
+   423→// ---------------------------------------------------------------------------
+   424→// Cancel
+   425→// ---------------------------------------------------------------------------
+   426→
+   427→async function cancelJob(jobId: string): Promise<void> {
+   428→  cancelledJobs.add(jobId)
+   429→  const child = childProcesses.get(jobId)
+   430→  if (child) {
+   431→    try {
+   432→      child.kill('SIGTERM')
+   433→      // Force-kill after 3s if still alive.
+   434→      setTimeout(() => {
+   435→        try {
+   436→          child.kill('SIGKILL')
+   437→        } catch {
+   438→          // ignore
+   439→        }
+   440→      }, 3000)
+   441→    } catch {
+   442→      // ignore
+   443→    }
+   444→  }
+   445→  await db.job.update({
+   446→    where: { id: jobId },
+   447→    data: { status: 'cancelled', stage: 'cancelled', message: 'Cancelled by user' },
+   448→  }).catch(() => undefined)
+   449→  await emitLog(jobId, 'warn', 'cancel', 'Job cancelled by user.')
+   450→  io.to(`job:${jobId}`).emit('cancelled', { type: 'cancelled', jobId })
+   451→  await emitStatus(jobId)
+   452→}
+   453→
+   454→// ---------------------------------------------------------------------------
+   455→// The core job pipeline
+   456→// ---------------------------------------------------------------------------
+   457→
+   458→async function processJob(jobId: string): Promise<void> {
+   459→  console.log(`[job:${jobId}] starting`)
+   460→  cancelledJobs.delete(jobId)
+   461→
+   462→  const job = await db.job.findUnique({
+   463→    where: { id: jobId },
+   464→    include: { chapters: { orderBy: { index: 'asc' } } },
+   465→  })
+   466→  if (!job) {
+   467→    console.error(`[job:${jobId}] not found`)
+   468→    return
+   469→  }
+   470→  if (job.status === 'cancelled') {
+   471→    console.log(`[job:${jobId}] already cancelled, skipping`)
+   472→    return
+   473→  }
+   474→
+   475→  // Prepare filesystem.
+   476→  await ensureDir(jobDir(jobId))
+   477→  await ensureDir(datasetDir(jobId))
+   478→  await ensureDir(workDir(jobId))
+   479→  await ensureDir(outputDir(jobId))
+   480→
+   481→  // -----------------------------
+   482→  // Phase 1: SCRAPE
+   483→  // -----------------------------
+   484→  await db.job.update({
+   485→    where: { id: jobId },
+   486→    data: { status: 'scraping', stage: 'scrape', message: 'Starting scrape' },
+   487→  })
+   488→  await emitStatus(jobId)
+   489→  await emitLog(jobId, 'info', 'scrape', `Starting scrape for "${job.mangaTitle}"`)
+   490→
+   491→  // If the API route did not pre-create Chapter rows, fetch them now.
+   492→  let chapters = job.chapters
+   493→  if (!chapters || chapters.length === 0) {
+   494→    const source = getSourceFromId(job.mangaId)
+   495→    if (!source) {
+   496→      throw new Error(`Cannot determine scraping source from manga ID: ${job.mangaId}`)
+   497→    }
+   498→    await emitLog(jobId, 'info', 'scrape', `Fetching chapter list from ${source}`)
+   499→    const fetched = await fetchChaptersForSource(source, job.mangaId, job.chapterLimit)
+   500→    if (fetched.length === 0) {
+   501→      throw new Error(`No chapters found for manga ${job.mangaId} on ${source}`)
+   502→    }
+   503→    // Create Chapter rows.
+   504→    for (let i = 0; i < fetched.length; i++) {
+   505→      const c = fetched[i]
+   506→      await db.chapter.create({
+   507→        data: {
+   508→          jobId,
+   509→          index: i + 1,
+   510→          mangadexId: c.mangadexId,
+   511→          chapterNum: c.chapterNum,
+   512→          title: c.title,
+   513→          language: c.language,
+   514→          pageCount: 0,
+   515→          folder: `chapter_${String(i + 1).padStart(3, '0')}`,
+   516→          status: 'pending',
+   517→        },
+   518→      })
+   519→    }
+   520→    chapters = await db.chapter.findMany({
+   521→      where: { jobId },
+   522→      orderBy: { index: 'asc' },
+   523→    })
+   524→    await db.job.update({
+   525→      where: { id: jobId },
+   526→      data: {
+   527→        totalChapters: chapters.length,
+   528→        sourceLang: chapters[0]?.language ?? job.language,
+   529→      },
+   530→    })
+   531→  } else {
+   532→    await db.job.update({
+   533→      where: { id: jobId },
+   534→      data: {
+   535→        totalChapters: chapters.length,
+   536→        sourceLang: chapters[0]?.language ?? job.language,
+   537→      },
+   538→    })
+   539→  }
+   540→
+   541→  await emitLog(jobId, 'info', 'scrape', `Found ${chapters.length} chapters to scrape`)
+   542→
+   543→  // Track total image counts.
+   544→  let totalImages = 0
+   545→  let doneImages = 0
+   546→
+   547→  // Scrape each chapter sequentially (rate-limit friendly).
+   548→  for (const ch of chapters) {
+   549→    if (cancelledJobs.has(jobId)) {
+   550→      await emitLog(jobId, 'warn', 'scrape', 'Cancelled during scrape')
+   551→      return
+   552→    }
+   553→    try {
+   554→      const cDir = chapterDir(jobId, ch.index)
+   555→      await ensureDir(cDir)
+   556→
+   557→      const source = getSourceFromId(job.mangaId)
+   558→      if (!source) {
+   559→        throw new Error(`Cannot determine scraping source from manga ID: ${job.mangaId}`)
+   560→      }
+   561→      const imageUrls = await fetchImagesForSource(source, job.mangaId, ch.mangadexId)
+   562→      if (imageUrls.length === 0) {
+   563→        await emitLog(jobId, 'warn', 'scrape', `Chapter ${ch.index} has 0 pages, skipping`)
+   564→        await db.chapter.update({
+   565→          where: { id: ch.id },
+   566→          data: { status: 'error', error: 'No pages' },
+   567→        })
+   568→        continue
+   569→      }
+   570→
+   571→      let downloaded = 0
+   572→      for (let i = 0; i < imageUrls.length; i++) {
+   573→        if (cancelledJobs.has(jobId)) {
+   574→          await emitLog(jobId, 'warn', 'scrape', 'Cancelled mid-chapter')
+   575→          return
+   576→        }
+   577→        const destName = `${String(i + 1).padStart(3, '0')}.jpg`
+   578→        const destPath = path.join(cDir, destName)
+   579→        // Skip if already downloaded (resumable).
+   580→        if (await fileExists(destPath)) {
+   581→          downloaded++
+   582→          continue
+   583→        }
+   584→        try {
+   585→          await downloadImageForSource(source, imageUrls[i], destPath)
+   586→          downloaded++
+   587→          doneImages++
+   588→          // Rate limit: 300ms between images.
+   589→          await sleep(300)
+   590→        } catch (err) {
+   591→          await emitLog(
+   592→            jobId,
+   593→            'warn',
+   594→            'scrape',
+   595→            `Failed image ${i + 1} of chapter ${ch.index}: ${err instanceof Error ? err.message : String(err)}`,
+   596→          )
+   597→        }
+   598→        totalImages++
+   599→        // Emit progress every few images.
+   600→        if (i % 3 === 0 || i === imageUrls.length - 1) {
+   601→          await emitProgress(jobId, {
+   602→            progress: 5 + (doneImages / Math.max(1, totalImages + (imageUrls.length - i - 1))) * 25,
+   603→            doneChapters: 0,
+   604→            totalChapters: chapters.length,
+   605→            doneImages,
+   606→            totalImages,
+   607→            stage: 'scrape',
+   608→            message: `Scraping chapter ${ch.index}/${chapters.length}: image ${i + 1}/${imageUrls.length}`,
+   609→          })
+   610→        }
+   611→      }
+   612→
+   613→      // Recount totalImages for this chapter to keep counts accurate.
+   614→      totalImages = Math.max(totalImages, doneImages)
+   615→
+   616→      const updated = await db.chapter.update({
+   617→        where: { id: ch.id },
+   618→        data: {
+   619→          pageCount: downloaded,
+   620→          status: 'scraped',
+   621→          folder: `chapter_${String(ch.index).padStart(3, '0')}`,
+   622→        },
+   623→      })
+   624→      await db.job.update({
+   625→        where: { id: jobId },
+   626→        data: { doneImages, totalImages },
+   627→      })
+   628→      await emitChapter(jobId, updated)
+   629→      await emitLog(
+   630→        jobId,
+   631→        'success',
+   632→        'scrape',
+   633→        `Chapter ${ch.index}/${chapters.length} scraped: ${downloaded} images`,
+   634→      )
+   635→    } catch (err) {
+   636→      const msg = err instanceof Error ? err.message : String(err)
+   637→      await emitLog(jobId, 'error', 'scrape', `Chapter ${ch.index} scrape failed: ${msg}`)
+   638→      const updated = await db.chapter.update({
+   639→        where: { id: ch.id },
+   640→        data: { status: 'error', error: msg },
+   641→      })
+   642→      await emitChapter(jobId, updated)
+   643→    }
+   644→  }
+   645→
+   646→  // Finalize scrape counts.
+   647→  await db.job.update({
+   648→    where: { id: jobId },
+   649→    data: { totalImages, doneImages, doneChapters: 0 },
+   650→  })
+   651→  await emitLog(
+   652→    jobId,
+   653→    'success',
+   654→    'scrape',
+   655→    `Scrape complete: ${doneImages} images across ${chapters.length} chapters`,
+   656→  )
+   657→
+   658→  if (cancelledJobs.has(jobId)) return
+   659→
+   660→  // -----------------------------
+   661→  // Phase 2: TRANSCRIBE (VLM) — read bubble/caption text from each panel
+   662→  // -----------------------------
+   663→  await db.job.update({
+   664→    where: { id: jobId },
+   665→    data: { status: 'summarizing', stage: 'transcribe', message: 'Reading panel text with VLM' },
+   666→  })
+   667→  await emitStatus(jobId)
+   668→  await emitLog(jobId, 'info', 'transcribe', 'Transcribing speech bubbles and captions from each panel image')
+   669→
+   670→  // Reload chapters to get the latest state.
+   671→  const scrapedChapters = await db.chapter.findMany({
+   672→    where: { jobId, status: 'scraped' },
+   673→    orderBy: { index: 'asc' },
+   674→  })
+   675→
+   676→  let summarizedCount = 0
+   677→  for (const ch of scrapedChapters) {
+   678→    if (cancelledJobs.has(jobId)) {
+   679→      await emitLog(jobId, 'warn', 'transcribe', 'Cancelled during transcription')
+   680→      return
+   681→    }
+   682→    const cDir = chapterDir(jobId, ch.index)
+   683→    // List images in the chapter dir (sorted).
+   684→    let imageFiles: string[] = []
+   685→    try {
+   686→      const entries = await fs.readdir(cDir)
+   687→      imageFiles = entries
+   688→        .filter((f) => /\.(jpe?g|png|webp|gif)$/i.test(f))
+   689→        .sort()
+   690→        .map((f) => path.join(cDir, f))
+   691→    } catch {
+   692→      // no images, skip
+   693→      continue
+   694→    }
+   695→    if (imageFiles.length === 0) {
+   696→      // Still write a minimal summary so the Python pipeline has something.
+   697→      await fs.writeFile(path.join(cDir, 'summary.txt'), 'The chapter continues the story.', 'utf8')
+   698→      const updated = await db.chapter.update({
+   699→        where: { id: ch.id },
+   700→        data: { status: 'summarized', summarized: true },
+   701→      })
+   702→      await emitChapter(jobId, updated)
+   703→      summarizedCount++
+   704→      continue
+   705→    }
+   706→
+   707→    // Skip if narration.json already exists (resume support).
+   708→    const narrationFile = path.join(cDir, 'narration.json')
+   709→    if (await fileExists(narrationFile)) {
+   710→      await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index} transcriptions already cached — skipping`)
+   711→      const updated = await db.chapter.update({
+   712→        where: { id: ch.id },
+   713→        data: { status: 'summarized', summarized: true },
+   714→      })
+   715→      await emitChapter(jobId, updated)
+   716→      summarizedCount++
+   717→      continue
+   718→    }
+   719→
+   720→    try {
+   721→      await emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: transcribing ${imageFiles.length} images...`)
+   722→      const narrations = await generateImageNarrations(imageFiles, (done, total) => {
+   723→        // Per-image progress within this chapter.
+   724→        void emitLog(jobId, 'info', 'transcribe', `Chapter ${ch.index}: ${done}/${total} images transcribed`)
+   725→      })
+   726→      // Save per-image narrations as narration.json (consumed by the Python pipeline).
+   727→      await fs.writeFile(narrationFile, JSON.stringify(narrations, null, 2), 'utf8')
+   728→      // Also save a chapter-level summary.txt for backward compat (concatenation of all narrations).
+   729→      const chapterSummary = narrations.map((n) => n.text).join(' ')
+   730→      await fs.writeFile(path.join(cDir, 'summary.txt'), chapterSummary, 'utf8')
+   731→
+   732→      const updated = await db.chapter.update({
+   733→        where: { id: ch.id },
+   734→        data: { status: 'summarized', summarized: true },
+   735→      })
+   736→      summarizedCount++
+   737→      await emitChapter(jobId, updated)
+   738→      await emitLog(
+   739→        jobId,
+   740→        'success',
+   741→        'transcribe',
+   742→        `Chapter ${ch.index} transcribed: ${narrations.length} images, ${chapterSummary.length} total chars`,
+   743→      )
+   744→    } catch (err) {
+   745→      const msg = err instanceof Error ? err.message : String(err)
+   746→      await emitLog(jobId, 'error', 'transcribe', `Chapter ${ch.index} transcription failed: ${msg}`)
+   747→      // Write a fallback summary so the pipeline can still proceed.
+   748→      await fs.writeFile(path.join(cDir, 'summary.txt'), 'The chapter continues the story.', 'utf8')
+   749→      const updated = await db.chapter.update({
+   750→        where: { id: ch.id },
+   751→        data: { status: 'summarized', summarized: true },
+   752→      })
+   753→      await emitChapter(jobId, updated)
+   754→    }
+   755→
+   756→    await emitProgress(jobId, {
+   757→      progress: 30 + (summarizedCount / Math.max(1, scrapedChapters.length)) * 15,
+   758→      doneChapters: summarizedCount,
+   759→      totalChapters: chapters.length,
+   760→      doneImages,
+   761→      totalImages,
+   762→      stage: 'transcribe',
+   763→      message: `Transcribing chapter ${ch.index}/${scrapedChapters.length}`,
+   764→    })
+   765→  }
+   766→
+   767→  await db.job.update({
+   768→    where: { id: jobId },
+   769→    data: { doneChapters: summarizedCount },
+   770→  })
+   771→  await emitLog(
+   772→    jobId,
+   773→    'success',
+   774→    'transcribe',
+   775→    `Transcription complete: ${summarizedCount}/${scrapedChapters.length} chapters`,
+   776→  )
+   777→
+   778→  if (cancelledJobs.has(jobId)) return
+   779→
+   780→  // -----------------------------
+   781→  // Phase 3: RENDER (Python pipeline)
+   782→  // -----------------------------
+   783→  await db.job.update({
+   784→    where: { id: jobId },
+   785→    data: { status: 'rendering', stage: 'render', message: 'Running master_pipeline.py' },
+   786→  })
+   787→  await emitStatus(jobId)
+   788→  await emitLog(jobId, 'info', 'render', 'Spawning Python master_pipeline.py')
+   789→
+   790→  const outFile = outputVideoPath(jobId)
+   791→  const progressFile = progressFilePath(jobId)
+   792→  // Reset the progress file so we don't read stale data.
+   793→  try {
+   794→    await fs.unlink(progressFile)
+   795→  } catch {
+   796→    // ignore
+   797→  }
+   798→
+   799→  const args: string[] = [
+   800→    PIPELINE_SCRIPT,
+   801→    '--input-dir', datasetDir(jobId),
+   802→    '--output', outFile,
+   803→    '--work-dir', workDir(jobId),
+   804→    '--voice', job.voice,
+   805→    '--narration-provider', 'none',
+   806→    '--skip-captions',
+   807→    '--progress-file', progressFile,
+   808→    '--keep-temp',
+   809→  ]
+   810→  if (job.groqKey) {
+   811→    args.push('--groq-api-key', job.groqKey)
+   812→  }
+   813→  if (job.openaiKey) {
+   814→    args.push('--openai-api-key', job.openaiKey)
+   815→  }
+   816→  if (!job.translate) {
+   817→    args.push('--no-translate')
+   818→  }
+   819→  // BGM overlay: use the job's custom BGM if provided, else the default cinematic track.
+   820→  if (job.useBgm) {
+   821→    const BGM_DIR = path.join('/home/z/my-project/data/bgm')
+   822→    let bgmFile: string | null = null
+   823→    if (job.bgmPath) {
+   824→      const customPath = path.join(BGM_DIR, job.bgmPath)
+   825→      if (await fileExists(customPath)) {
+   826→        bgmFile = customPath
+   827→      }
+   828→    }
+   829→    if (!bgmFile) {
+   830→      const defaultPath = path.join(BGM_DIR, 'default_cinematic.mp3')
+   831→      if (await fileExists(defaultPath)) {
+   832→        bgmFile = defaultPath
+   833→      }
+   834→    }
+   835→    if (bgmFile) {
+   836→      args.push('--bgm', bgmFile)
+   837→      await emitLog(jobId, 'info', 'render', `BGM: ${path.basename(bgmFile)} will be overlaid at -20dB`)
+   838→    }
+   839→  }
+   840→
+   841→  // Log the command but redact API keys so they never appear in the UI log.
+   842→  const redactedArgs = args.map((a) => {
+   843→    if (/^(gsk_|sk-)/.test(a)) return a.slice(0, 8) + '***REDACTED***'
+   844→    return a
+   845→  })
+   846→  await emitLog(jobId, 'info', 'render', `CMD: ${PYTHON_BIN} ${redactedArgs.join(' ')}`)
+   847→
+   848→  // Ensure the cwd exists before spawning — prevents uv_cwd ENOENT crashes
+   849→  // if the job directory was cleaned up or not yet created.
+   850→  const spawnCwd = jobDir(jobId)
+   851→  try {
+   852→    await fs.mkdir(spawnCwd, { recursive: true })
+   853→  } catch {
+   854→    // fall back to the repo root if the job dir can't be created
+   855→  }
+   856→
+   857→  const child = spawn(PYTHON_BIN, args, {
+   858→    cwd: spawnCwd,
+   859→    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+   860→  })
+   861→  childProcesses.set(jobId, child)
+   862→
+   863→  // Poll the progress file every 1s while the process runs.
+   864→  const pollTimer = setInterval(async () => {
+   865→    try {
+   866→      const raw = await fs.readFile(progressFile, 'utf8')
+   867→      const prog = JSON.parse(raw) as {
+   868→        stage: string
+   869→        chapter_index: number
+   870→        total_chapters: number
+   871→        progress: number
+   872→        message: string
+   873→        status: string
+   874→        updated_at: number
+   875→      }
+   876→      let pct = 45
+   877→      let stage = 'render'
+   878→      if (prog.stage === 'render') {
+   879→        pct = 45 + (prog.chapter_index / Math.max(1, prog.total_chapters)) * 50
+   880→        stage = 'render'
+   881→      } else if (prog.stage === 'merge') {
+   882→        pct = 95
+   883→        stage = 'merge'
+   884→      } else if (prog.stage === 'bgm') {
+   885→        pct = 97
+   886→        stage = 'bgm'
+   887→      } else if (prog.stage === 'done') {
+   888→        pct = 100
+   889→        stage = 'done'
+   890→      }
+   891→      await emitProgress(jobId, {
+   892→        progress: pct,
+   893→        doneChapters: summarizedCount,
+   894→        totalChapters: chapters.length,
+   895→        doneImages,
+   896→        totalImages,
+   897→        stage,
+   898→        message: prog.message || `${stage} phase`,
+   899→      })
+   900→    } catch {
+   901→      // progress file not yet written — ignore
+   902→    }
+   903→  }, 1000)
+   904→
+   905→  // Stream stdout/stderr line-by-line into JobLog.
+   906→  const lineBuffers: { stdout: string; stderr: string } = { stdout: '', stderr: '' }
+   907→
+   908→  child.stdout?.on('data', (chunk: Buffer) => {
+   909→    lineBuffers.stdout += chunk.toString('utf8')
+   910→    let idx: number
+   911→    while ((idx = lineBuffers.stdout.indexOf('\n')) >= 0) {
+   912→      const line = lineBuffers.stdout.slice(0, idx).trim()
+   913→      lineBuffers.stdout = lineBuffers.stdout.slice(idx + 1)
+   914→      if (line) void emitLog(jobId, 'info', 'render', line)
+   915→    }
+   916→  })
+   917→  child.stderr?.on('data', (chunk: Buffer) => {
+   918→    lineBuffers.stderr += chunk.toString('utf8')
+   919→    let idx: number
+   920→    while ((idx = lineBuffers.stderr.indexOf('\n')) >= 0) {
+   921→      const line = lineBuffers.stderr.slice(0, idx).trim()
+   922→      lineBuffers.stderr = lineBuffers.stderr.slice(idx + 1)
+   923→      if (line) void emitLog(jobId, 'warn', 'render', line)
+   924→    }
+   925→  })
+   926→
+   927→  const exitCode: number = await new Promise((resolve) => {
+   928→    child.on('exit', (code) => resolve(code ?? -1))
+   929→    child.on('error', (err) => {
+   930→      void emitLog(jobId, 'error', 'render', `spawn error: ${err.message}`)
+   931→      resolve(-1)
+   932→    })
+   933→  })
+   934→
+   935→  clearInterval(pollTimer)
+   936→  childProcesses.delete(jobId)
+   937→
+   938→  // Flush any remaining buffered output.
+   939→  if (lineBuffers.stdout.trim()) {
+   940→    await emitLog(jobId, 'info', 'render', lineBuffers.stdout.trim())
+   941→  }
+   942→  if (lineBuffers.stderr.trim()) {
+   943→    await emitLog(jobId, 'warn', 'render', lineBuffers.stderr.trim())
+   944→  }
+   945→
+   946→  if (cancelledJobs.has(jobId)) {
+   947→    await emitLog(jobId, 'warn', 'render', 'Cancelled during render')
+   948→    return
+   949→  }
+   950→
+   951→  if (exitCode === 0) {
+   952→    // Verify the output file actually exists before marking as done.
+   953→    const outputExists = await fileExists(outFile)
+   954→    if (!outputExists) {
+   955→      const msg = `Pipeline exited 0 but output file is missing: ${outFile}`
+   956→      await emitLog(jobId, 'error', 'render', msg)
+   957→      await db.job.update({
+   958→        where: { id: jobId },
+   959→        data: { status: 'error', error: msg, stage: 'render' },
+   960→      })
+   961→      await emitStatus(jobId)
+   962→      io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: msg })
+   963→      return
+   964→    }
+   965→    const outName = path.basename(outFile)
+   966→
+   967→    // -----------------------------
+   968→    // Reclaim disk space: intermediate work/ (sliced frames, per-panel
+   969→    // audio, per-chapter renders) and dataset/ (raw scraped chapter images)
+   970→    // are never needed again once the final video exists. For a large job
+   971→    // (e.g. 200 chapters) these dwarf the final compressed video, so this
+   972→    // alone is the biggest single win for disk usage.
+   973→    // -----------------------------
+   974→    for (const dir of [workDir(jobId), datasetDir(jobId)]) {
+   975→      try {
+   976→        await fs.rm(dir, { recursive: true, force: true })
+   977→      } catch (e) {
+   978→        await emitLog(jobId, 'warn', 'done', `Could not clean up ${dir}: ${e instanceof Error ? e.message : e}`)
+   979→      }
+   980→    }
+   981→    await emitLog(jobId, 'info', 'done', 'Cleaned up intermediate work/dataset files')
+   982→
+   983→    // -----------------------------
+   984→    // Offload the final video to Cloudflare R2, then free the local copy
+   985→    // too, so completed jobs don't keep accumulating local disk usage.
+   986→    // Only deletes the local file after the upload is verified to have
+   987→    // landed — if R2 isn't configured, or the upload fails, the local
+   988→    // file is left in place so the job is never left without a copy.
+   989→    // -----------------------------
+   990→    let r2Key: string | null = null
+   991→    if (isR2Configured()) {
+   992→      const key = `jobs/${jobId}/${outName}`
+   993→      try {
+   994→        await uploadFileToR2(outFile, key)
+   995→        await fs.rm(outFile, { force: true })
+   996→        r2Key = key
+   997→        await emitLog(jobId, 'success', 'done', `Uploaded output to R2 (${key}) and freed local copy`)
+   998→      } catch (e) {
+   999→        await emitLog(
+  1000→          jobId,
+  1001→          'warn',
+  1002→          'done',
+  1003→          `R2 upload failed, keeping local copy: ${e instanceof Error ? e.message : e}`,
+  1004→        )
+  1005→      }
+  1006→    }
+  1007→
+  1008→    await db.job.update({
+  1009→      where: { id: jobId },
+  1010→      data: {
+  1011→        status: 'done',
+  1012→        progress: 100,
+  1013→        stage: 'done',
+  1014→        message: 'Pipeline complete',
+  1015→        outputDir: outputDir(jobId),
+  1016→        outputVideo: outName,
+  1017→        r2Key,
+  1018→      },
+  1019→    })
+  1020→    await emitLog(jobId, 'success', 'done', `Pipeline complete. Output: ${outName}`)
+  1021→    io.to(`job:${jobId}`).emit('done', { type: 'done', jobId, outputVideo: outName })
+  1022→    await emitStatus(jobId)
+  1023→    console.log(`[job:${jobId}] done`)
+  1024→  } else {
+  1025→    const err = `master_pipeline.py exited with code ${exitCode}`
+  1026→    await db.job.update({
+  1027→      where: { id: jobId },
+  1028→      data: { status: 'error', stage: 'render', error: err, message: err },
+  1029→    })
+  1030→    await emitLog(jobId, 'error', 'render', err)
+  1031→    io.to(`job:${jobId}`).emit('error', { type: 'error', jobId, error: err })
+  1032→    await emitStatus(jobId)
+  1033→    console.error(`[job:${jobId}] failed: ${err}`)
+  1034→  }
+  1035→}
+  1036→
+  1037→// ---------------------------------------------------------------------------
+  1038→// HTTP helpers
+  1039→// ---------------------------------------------------------------------------
+  1040→
+  1041→async function readBody(req: IncomingMessage): Promise<any> {
+  1042→  return await new Promise((resolve) => {
+  1043→    const chunks: Buffer[] = []
+  1044→    req.on('data', (c) => chunks.push(c as Buffer))
+  1045→    req.on('end', () => {
+  1046→      const raw = Buffer.concat(chunks).toString('utf8')
+  1047→      if (!raw) {
+  1048→        resolve({})
+  1049→        return
+  1050→      }
+  1051→      try {
+  1052→        resolve(JSON.parse(raw))
+  1053→      } catch {
+  1054→        resolve({})
+  1055→      }
+  1056→    })
+  1057→    req.on('error', () => resolve({}))
+  1058→  })
+  1059→}
+  1060→
+  1061→function sendJson(res: ServerResponse, code: number, body: unknown) {
+  1062→  const json = JSON.stringify(body)
+  1063→  res.writeHead(code, {
+  1064→    'Content-Type': 'application/json',
+  1065→    'Content-Length': Buffer.byteLength(json),
+  1066→  })
+  1067→  res.end(json)
+  1068→}
+  1069→
+  1070→// ---------------------------------------------------------------------------
+  1071→// Boot + graceful shutdown
+  1072→// ---------------------------------------------------------------------------
+  1073→
+  1074→httpServer.listen(PORT, () => {
+  1075→  console.log(`[pipeline-service] listening on port ${PORT} (socket.io path "/")`)
+  1076→})
+  1077→
+  1078→async function shutdown(signal: string) {
+  1079→  console.log(`[pipeline-service] received ${signal}, shutting down`)
+  1080→  // Kill any running subprocesses.
+  1081→  for (const [jobId, child] of childProcesses.entries()) {
+  1082→    try {
+  1083→      child.kill('SIGTERM')
+  1084→      console.log(`[pipeline-service] killed subprocess for job ${jobId}`)
+  1085→    } catch {
+  1086→      // ignore
+  1087→    }
+  1088→  }
+  1089→  childProcesses.clear()
+  1090→  // Close socket.io + HTTP server.
+  1091→  io.close()
+  1092→  httpServer.close(() => {
+  1093→    console.log('[pipeline-service] http server closed')
+  1094→    process.exit(0)
+  1095→  })
+  1096→  // Force-exit after 5s if close hangs.
+  1097→  setTimeout(() => process.exit(0), 5000).unref()
+  1098→}
+  1099→
+  1100→process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  1101→process.on('SIGINT', () => void shutdown('SIGINT'))
+  1102→
+  1103→// Handle uncaught errors so the service doesn't silently die.
+  1104→process.on('uncaughtException', (err) => {
+  1105→  console.error('[pipeline-service] uncaughtException:', err)
+  1106→})
+  1107→process.on('unhandledRejection', (err) => {
+  1108→  console.error('[pipeline-service] unhandledRejection:', err)
+  1109→})
+  1110→

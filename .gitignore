@@ -1,92 +1,64 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
 
-# dependencies
-node_modules
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
+# Next.js
+.next/
+out/
 
-# testing
-/coverage
+# Build
+dist/
+build/
 
-# next.js
-/.next/
-/out/
+# Database
+*.db
+*.db-journal
+db/
 
-# production
-/build
+# Environment
+.env
+.env.local
+.env.*.local
 
-# misc
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
 .DS_Store
-*.pem
+Thumbs.db
 
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
 
-# env files (can opt-in for committing if needed)
-.env*
+# Pipeline temp files
+_pipeline_work/
+temp_*/
+*.padded.mp3
 
-# vercel
-.vercel
+# Data (user content)
+data/
 
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
-local-*
-.claude
-.z-ai-config
+# Logs
 *.log
 dev.log
-dev.out.log
-test
-prompt
+pipeline-service.log
+serve.log
+supervisor.log
+keepalive.log
 
-server.log
-# Skills directory
-/skills/
-
-# Pipeline data (scraped images, rendered videos, work dirs — too large for git)
-/data/jobs/
-/data/bgm/*.mp3
-/data/bgm/*.wav
-/data/bgm/*.ogg
-/data/bgm/*.m4a
-
-# Mini-service dependencies
-/mini-services/*/node_modules/
-/mini-services/*/dist/
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# Agent context
-/agent-ctx/
-
-# Upload folder (user temp files)
-/upload/
-
-# Download folder
-/download/
-
-# Tool results
-/tool-results/
-
-# Tests
-/tests/
-
-# Worklog (internal)
-# worklog.md
-
-# Screenshots
-screenshot-*.png*.mp4
-TEMP_MPY*
+# Misc
+.tool-results/
+keep.sh
+keepalive.sh
+start.sh
+serve.sh
+run-all.sh
+screenshot.png
